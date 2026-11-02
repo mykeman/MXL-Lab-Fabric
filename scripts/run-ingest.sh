@@ -27,18 +27,33 @@ case "$AUDIO_CHANNELS" in 1|2|4|8) ;; *) AUDIO_CHANNELS=2 ;; esac
 AUDIO_MASK=$(printf '0x%x' $(( (1 << AUDIO_CHANNELS) - 1 )))
 
 # NDI_URL (ip:port) connects straight to the sender and skips discovery.
+url_arg=""
 if [ -n "${NDI_URL:-}" ]; then
-  set -- url-address="$NDI_URL"
-  echo "ndi-ingest: '$NDI_SRC' at $NDI_URL (direct) -> ${SRC_W}x${SRC_H} @ ${FPS_CAPS}, ${AUDIO_CHANNELS} ch audio"
+  url_arg="url-address=$NDI_URL"
+  where="at $NDI_URL (direct)"
 else
-  set --
-  echo "ndi-ingest: '$NDI_SRC' (discovery) -> ${SRC_W}x${SRC_H} @ ${FPS_CAPS}, ${AUDIO_CHANNELS} ch audio"
+  where="(discovery)"
 fi
 
-# videoscale is a passthrough when the source already matches SRC_W x SRC_H.
-# It is there so a source with a different size cannot change the geometry
-# of Flow A underneath the other functions.
-#
+# Does the source send audio? Listen for a few seconds before starting.
+# A demux.audio branch whose pad never appears stalls the whole live
+# pipeline (seen with GStreamer 1.28): Flow A is created but no frame is
+# ever committed. So the audio branch is only added when audio is there.
+# INGEST_AUDIO=on or off in .env skips the check.
+case "${INGEST_AUDIO:-auto}" in
+  on)  has_audio=yes ;;
+  off) has_audio=no ;;
+  *)
+    if timeout "${AUDIO_PROBE_S:-4}" gst-launch-1.0 -v \
+         ndisrc ndi-name="$NDI_SRC" ${url_arg:+"$url_arg"} ! ndisrcdemux name=probe \
+         probe.video ! fakesink sync=false probe.audio ! fakesink sync=false 2>/dev/null \
+       | grep -q "audio/x-raw"; then
+      has_audio=yes
+    else
+      has_audio=no
+    fi ;;
+esac
+
 # Audio:
 #   audioconvert with an empty mix-matrix maps channel N to channel N, padding
 #   with silence or dropping extra channels. Without it, sources with more than
@@ -47,10 +62,26 @@ fi
 #   audiorate makes the stream continuous, the audio equivalent of videorate:
 #   receive-time timestamps from NDI jitter, and MXL wants a regular sample
 #   cadence. skip-to-first stops it filling silence back to time zero.
-#   If the source sends no audio, the audio pad never appears and there is
-#   simply no audio flow.
+if [ "$has_audio" = yes ]; then
+  set -- demux.audio \
+    ! queue max-size-time=200000000 \
+    ! audioconvert mix-matrix="<>" \
+    ! "audio/x-raw,format=F32LE,layout=interleaved,channels=$AUDIO_CHANNELS,channel-mask=(bitmask)$AUDIO_MASK" \
+    ! audioresample ! audio/x-raw,rate=48000 \
+    ! audiorate skip-to-first=true \
+    ! mxlsink flow-id="$FLOW_AUDIO" domain="$MXL_DOMAIN"
+  echo "ndi-ingest: '$NDI_SRC' $where -> ${SRC_W}x${SRC_H} @ ${FPS_CAPS}, ${AUDIO_CHANNELS} ch audio"
+else
+  set --
+  echo "ndi-ingest: '$NDI_SRC' $where -> ${SRC_W}x${SRC_H} @ ${FPS_CAPS}, no audio (the source sent none" \
+       "within ${AUDIO_PROBE_S:-4} s; set INGEST_AUDIO=on in .env to force it)"
+fi
+
+# videoscale is a passthrough when the source already matches SRC_W x SRC_H.
+# It is there so a source with a different size cannot change the geometry
+# of Flow A underneath the other functions.
 exec gst-launch-1.0 -e \
-  ndisrc ndi-name="$NDI_SRC" "$@" timestamp-mode=receive-time \
+  ndisrc ndi-name="$NDI_SRC" ${url_arg:+"$url_arg"} timestamp-mode=receive-time \
   ! ndisrcdemux name=demux \
   demux.video \
     ! queue max-size-buffers=4 leaky=downstream \
@@ -59,10 +90,4 @@ exec gst-launch-1.0 -e \
     ! videoconvert ! video/x-raw,format=v210 \
     ! videorate ! video/x-raw,framerate="$FPS_CAPS" \
     ! mxlsink flow-id="$FLOW_A" domain="$MXL_DOMAIN" \
-  demux.audio \
-    ! queue max-size-time=200000000 \
-    ! audioconvert mix-matrix="<>" \
-    ! "audio/x-raw,format=F32LE,layout=interleaved,channels=$AUDIO_CHANNELS,channel-mask=(bitmask)$AUDIO_MASK" \
-    ! audioresample ! audio/x-raw,rate=48000 \
-    ! audiorate skip-to-first=true \
-    ! mxlsink flow-id="$FLOW_AUDIO" domain="$MXL_DOMAIN"
+  "$@"

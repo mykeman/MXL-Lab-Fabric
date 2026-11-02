@@ -21,6 +21,10 @@ MXL Lab Fabric: ST 2110 in and out, and MXL flows between two labs over RoCEv2.
 - The ordered restart follows the routing: it starts only the functions this lab runs, asks the peer for flows it expects, and pairs the flows it sends.
 - The Status tab and header lamps cover the new functions, and Needs attention reports fabric, peer and routing mismatches.
 
+### Fixed
+
+- NDI sources without audio gave a Flow A with no frames: the unlinked audio branch stalled the live pipeline on GStreamer 1.28 (Ubuntu 26.04). Ingest now listens for audio for a few seconds and adds the audio branch only when there is audio. `INGEST_AUDIO` in `.env` overrides it.
+
 ### Not yet verified
 
 - Built and run end to end on a pair of ConnectX ports. The settings, SDP handling, routing and pairing logic were checked locally, without RDMA hardware or the image build.

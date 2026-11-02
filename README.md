@@ -505,6 +505,7 @@ Settings live in `.env`. Choices made in the GUI are saved in `config/` and take
 | `GUI_PORT` | `8080` | Web GUI port |
 | `GUI_BIND` | `0.0.0.0` | Address the GUI listens on. Set the VM's management address to keep it off the media network |
 | `GUI_USER`, `GUI_PASSWORD` | blank | Optional login for the GUI. Both must be set to turn it on |
+| `INGEST_AUDIO` | `auto` | Make the audio flow only if the NDI source sends audio (`auto`), always (`on`) or never (`off`) |
 | `NDI_DISCOVERY` | `mdns` | Discovery method for a fresh install |
 | `FLOW_A`, `FLOW_B`, `FLOW_AUDIO` | fixed UUIDs | MXL flow IDs |
 | `UBUNTU_VERSION` | `24.04` | Ubuntu release for the container base |
@@ -602,6 +603,8 @@ sudo journalctl -k --since "1 hour ago" | grep 'apparmor="DENIED"' | tail
 Denials mentioning `dbus` mean a container is running without `apparmor:unconfined`. Recreate it with `docker compose up -d --force-recreate <service>`. As a workaround, put the sender's address in the NDI tab's Address field, or switch to a discovery server.
 
 **Ingest restarts every 10 seconds with "EOS without available srcpad(s)".** It never received a frame. The source name doesn't match exactly, or the source can't be discovered. Check the name against `avahi-browse -rt _ndi._tcp`, or set the Address.
+
+**Flow A is present but stays at 0 frames, with no errors.** Ingest connected, but nothing is committed. With an audio branch for a source that sends no audio, the whole pipeline stalls (seen with GStreamer 1.28). Ingest now checks for audio for a few seconds before it starts and leaves the audio branch out if there is none; the ingest log says which. If a source's audio starts late and is missed, set `INGEST_AUDIO=on` in `.env`.
 
 **An output shows no picture after a restart.** It likely attached to a flow that was being replaced. Use Apply and restart in the GUI, or `scripts/lab-apply.sh`.
 
