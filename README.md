@@ -133,8 +133,6 @@ tmux new -s setup
 ./setup.sh
 ```
 
-While the repository is private, `git clone` asks for a GitHub username and a [personal access token](https://github.com/settings/tokens) (not your password), or sign in first with `gh auth login` if the GitHub CLI is installed on the VM. Do the same on both lab VMs.
-
 Run it as your normal user, not root. It uses `sudo` where it needs to.
 
 The script:
