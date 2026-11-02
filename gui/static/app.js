@@ -9,6 +9,8 @@
 const LIMITS = {
   autoframeStaleS: 5,      // autoframe status older than this: not reporting
   audioStaleS: 3,          // AES67 sender status older than this: not reporting
+  st2110StaleS: 4,         // ST 2110 sender status older than this: not reporting
+  fabricStaleS: 4,         // fabric runner status older than this: not reporting
   frameRateTolerance: 0.05, // Flow A rate this far from the source rate: warn
   sendLagWarnMs: 2.5,      // packets leaving later than this after their timestamp: warn
   sendLagRedMs: 5,         // the same, shown in red on the AES67 panel
@@ -140,7 +142,7 @@ function drawWindow() {
 }
 
 /* ---------- status polling ---------- */
-const FN_LABEL = { "ndi-discovery": "Discovery server", "ndi-ingest": "NDI in", "autoframe": "Autoframe", "ndi-out-original": "Original out", "ndi-out-vertical": "Vertical out", "aes67-out": "AES67 out", "ptp": "PTP" };
+const FN_LABEL = { "ndi-discovery": "Discovery server", "ndi-ingest": "Ingest", "autoframe": "Autoframe", "ndi-out-original": "Original out", "ndi-out-vertical": "Vertical out", "aes67-out": "AES67 out", "st2110-out": "2110 out", "fabric": "Fabric", "ptp": "PTP" };
 const openLogs = new Set();
 
 // Escape text for HTML. Source names, addresses and error messages come from
@@ -231,6 +233,9 @@ async function poll() {
     showFlow("fa", status.flows.A, fps);
     showFlow("fb", status.flows.B, fps);
     showFlow("fx", status.flows.audio, fps, true);
+    showVia(status.routing || {});
+    showSt2110Status(status.st2110 || {});
+    showFabricStatus(status.fabric || {});
     showAudio(status.audio || {});
     showPtp(status.ptp || {}, status.ptp_mode);
     showJob(status.job);
@@ -373,8 +378,9 @@ $("apply").addEventListener("click", async () => {
   } catch (e) { $("joblog").hidden = false; $("joblog").className = "joblog failed"; $("joblog").textContent = e.message; }
 });
 
-const JOB_BOX = { discovery: "disc-log", audio: "audio-log", ptp: "ptp-log", pipeline: "joblog" };
-const APPLY_BUTTONS = ["apply", "disc-apply", "a-apply", "p-apply"];
+const JOB_BOX = { discovery: "disc-log", audio: "audio-log", ptp: "ptp-log", pipeline: "joblog",
+  routing: "routing-log", st2110in: "st2110in-log", st2110: "st2110-log", fabric: "fabric-log" };
+const APPLY_BUTTONS = ["apply", "disc-apply", "a-apply", "p-apply", "r-apply", "s-in-apply", "s-out-apply", "f-apply"];
 let tracking = false;
 function showJob(j) {
   if (!j || (!j.running && !j.log.length)) return;
@@ -394,6 +400,7 @@ async function trackJob() {
   if (j.running) { setTimeout(trackJob, 700); return; }
   tracking = false;
   await loadPipeline(); await loadDiscovery(); await loadAudio(); await loadPtp(); loadSources();
+  await loadRouting(); await loadSt2110(); await loadFabric();
 }
 function startFailed(boxId, msg) {
   const box = $(boxId);
@@ -797,8 +804,260 @@ function drawGraph(hist) {
   g.stroke();
 }
 
+/* ---------- routing ---------- */
+const FLOW_LABEL = { A: "Flow A", B: "Flow B", audio: "Audio flow" };
+let routing = { input: "ndi", flow_b: "local", send: [] };
+let routePick = { input: "ndi", flow_b: "local" };
+const RIN_HELP = {
+  ndi: "The NDI ingest writes Flow A and the audio flow. Pick the source on the NDI tab.",
+  st2110: "The ST 2110 ingest writes Flow A and the audio flow, from the SDPs on the ST 2110 tab.",
+  peer: "Flow A and the audio flow arrive from the other lab over the fabric. Its routing must send them.",
+  none: "No Flow A or audio on this lab. Useful when this lab only takes Flow B from the peer.",
+};
+const RB_HELP = {
+  local: "Autoframe runs here, reading Flow A and writing Flow B.",
+  peer: "Flow B arrives from the other lab over the fabric, which runs autoframe. Its routing must send Flow B.",
+  off: "No Flow B on this lab.",
+};
+
+function localFlows(input, flowB) {
+  return [...(["ndi", "st2110"].includes(input) ? ["A", "audio"] : []), ...(flowB === "local" ? ["B"] : [])];
+}
+
+function showRoutePick() {
+  document.querySelectorAll("[data-rin]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.rin === routePick.input)));
+  document.querySelectorAll("[data-rb]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.rb === routePick.flow_b)));
+  $("rin-help").textContent = RIN_HELP[routePick.input];
+  $("rb-help").textContent = RB_HELP[routePick.flow_b];
+  const local = localFlows(routePick.input, routePick.flow_b);
+  const checked = new Set([...document.querySelectorAll("[data-send]:checked")].map((c) => c.dataset.send));
+  $("r-send").innerHTML = Object.entries(FLOW_LABEL).map(([k, label]) => {
+    const ok = local.includes(k);
+    return `<label class="check"><input type="checkbox" data-send="${k}" ${ok ? "" : "disabled"} ${ok && checked.has(k) ? "checked" : ""}> ${label}${ok ? "" : ", not made here"}</label>`;
+  }).join("");
+  const notes = [];
+  if (routePick.input === "none" && routePick.flow_b === "local") notes.push("Autoframe needs Flow A. Choose an input, or take Flow B from the peer.");
+  if ((routePick.input === "peer" || routePick.flow_b === "peer") && !fabricCfg.enabled) notes.push("This takes flows from the peer, but the fabric is off.");
+  $("r-warn").hidden = !notes.length;
+  $("r-warn").className = "note warn";
+  $("r-warn").textContent = notes.join(" ");
+}
+
+async function loadRouting() {
+  const r = await api("/api/routing");
+  routing = r.settings;
+  routePick = { input: routing.input, flow_b: routing.flow_b };
+  $("r-ndi-a").checked = !!routing.ndi_out_original;
+  $("r-ndi-b").checked = !!routing.ndi_out_vertical;
+  $("r-send").innerHTML = Object.keys(FLOW_LABEL).map((k) => `<input type="checkbox" data-send="${k}" ${routing.send.includes(k) ? "checked" : ""} hidden>`).join("");
+  showRoutePick();
+  const from = { ndi: "NDI", st2110: "ST 2110", peer: "the peer", none: "nothing" }[routing.input];
+  $("r-current").textContent = `In use: input from ${from}` + (routing.send.length ? `, sending ${routing.send.map((k) => FLOW_LABEL[k]).join(", ")}` : "");
+}
+
+document.querySelectorAll("[data-rin]").forEach((b) => b.addEventListener("click", () => { routePick.input = b.dataset.rin; showRoutePick(); }));
+document.querySelectorAll("[data-rb]").forEach((b) => b.addEventListener("click", () => { routePick.flow_b = b.dataset.rb; showRoutePick(); }));
+
+$("r-apply").addEventListener("click", async () => {
+  const body = {
+    input: routePick.input, flow_b: routePick.flow_b,
+    ndi_out_original: $("r-ndi-a").checked, ndi_out_vertical: $("r-ndi-b").checked,
+    send: [...document.querySelectorAll("[data-send]:checked")].map((c) => c.dataset.send),
+  };
+  try { await api("/api/routing/apply", { method: "POST", body: JSON.stringify(body) }); if (!tracking) trackJob(); }
+  catch (e) { startFailed("routing-log", e.message); }
+});
+
+function showVia(r) {
+  const peer = new Set([...(r.input === "peer" ? ["A", "audio"] : []), ...(r.flow_b === "peer" ? ["B"] : [])]);
+  const send = new Set(r.send || []);
+  for (const [k, id] of [["A", "fa-via"], ["B", "fb-via"], ["audio", "fx-via"]]) {
+    $(id).textContent = peer.has(k) ? "from the peer" : send.has(k) ? "also to the peer" : "";
+  }
+}
+
+/* ---------- ST 2110 ---------- */
+let st2110Cfg = { out: {} };
+
+function sdpSummary(id, sum) {
+  const el = $(id);
+  el.classList.toggle("bad", !!sum && !sum.ok);
+  if (!sum) { el.textContent = ""; return; }
+  if (!sum.ok) { el.textContent = sum.error; return; }
+  const where = `${sum.address}:${sum.port}` + (sum.source ? ` from ${sum.source}` : "");
+  el.textContent = sum.width
+    ? `${sum.width}x${sum.height} @ ${sum.fps}, ${sum.depth} bit, ${where}`
+    : `${sum.channels} ch ${sum.encoding}, ${where}`;
+}
+
+let sdpTimer = null;
+function checkSdps() {
+  clearTimeout(sdpTimer);
+  sdpTimer = setTimeout(async () => {
+    for (const [ta, out, media] of [["s-vsdp", "s-vsum", "video"], ["s-asdp", "s-asum", "audio"]]) {
+      const text = $(ta).value;
+      if (!text.trim()) { sdpSummary(out, null); continue; }
+      try { sdpSummary(out, await api("/api/st2110/check", { method: "POST", body: JSON.stringify({ text, media }) })); }
+      catch (e) { sdpSummary(out, { ok: false, error: e.message }); }
+    }
+  }, 300);
+}
+["s-vsdp", "s-asdp"].forEach((id) => $(id).addEventListener("input", checkSdps));
+
+function buildOutputs() {
+  $("s-outs").innerHTML = ["A", "B"].map((k) => {
+    const o = st2110Cfg.out[k] || {};
+    return `<div class="out2110">
+      <label class="check"><input type="checkbox" id="so-${k}-on" ${o.enabled ? "checked" : ""}> Send ${FLOW_LABEL[k]}${k === "A" ? ", 16:9" : ", 9:16"}</label>
+      <div class="grid-wide">
+        <label class="field"><span>Multicast address</span><input id="so-${k}-addr" value="${esc(o.address)}" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>Port</span><input id="so-${k}-port" type="number" min="1024" max="65534" step="2" value="${esc(o.port)}"></label>
+        <label class="field"><span>Payload type</span><input id="so-${k}-pt" type="number" min="96" max="127" value="${esc(o.payload_type)}"></label>
+        <label class="field"><span>Session name</span><input id="so-${k}-name" maxlength="64" value="${esc(o.session_name)}" placeholder="MXL Lab ${FLOW_LABEL[k]}"></label>
+      </div>
+      <div class="row"><span class="saved num" id="so-${k}-live">-</span><a class="btn small" href="/api/st2110/sdp/${k}" download="mxl-lab-flow-${k}.sdp">Download SDP</a></div>
+    </div>`;
+  }).join("");
+}
+
+async function loadSt2110() {
+  const r = await api("/api/st2110");
+  st2110Cfg = r.settings;
+  $("s-vsdp").value = st2110Cfg.in_video_sdp;
+  $("s-asdp").value = st2110Cfg.in_audio_sdp;
+  sdpSummary("s-vsum", r.video);
+  sdpSummary("s-asum", r.audio);
+  $("s-in-iface").innerHTML = ifaceOptions(r.ifaces, st2110Cfg.in_iface, r.default_iface, false);
+  $("s-out-iface").innerHTML = ifaceOptions(r.ifaces, st2110Cfg.out_iface, r.default_iface, false);
+  $("s-buf").value = st2110Cfg.in_buffer_mb;
+  $("s-ttl").value = st2110Cfg.ttl;
+  $("s-dscp").value = st2110Cfg.dscp;
+  $("s-read").value = st2110Cfg.read_delay_ms;
+  $("s-mtu").value = st2110Cfg.mtu;
+  $("s-pace").checked = !!st2110Cfg.pace;
+  buildOutputs();
+  $("s-in-current").textContent = routing.input === "st2110" ? "In use as the input" : "Not the input. Choose ST 2110 on the Routing tab to use it.";
+}
+
+$("s-in-apply").addEventListener("click", async () => {
+  const body = { in_video_sdp: $("s-vsdp").value, in_audio_sdp: $("s-asdp").value,
+    in_iface: $("s-in-iface").value, in_buffer_mb: Number($("s-buf").value) };
+  try { await api("/api/st2110/input", { method: "POST", body: JSON.stringify(body) }); if (!tracking) trackJob(); }
+  catch (e) { startFailed("st2110in-log", e.message); }
+});
+
+$("s-out-apply").addEventListener("click", async () => {
+  const out = {};
+  for (const k of ["A", "B"]) {
+    out[k] = { enabled: $(`so-${k}-on`).checked, address: $(`so-${k}-addr`).value.trim(), port: Number($(`so-${k}-port`).value),
+      payload_type: Number($(`so-${k}-pt`).value), session_name: $(`so-${k}-name`).value.trim() };
+  }
+  const body = { out, out_iface: $("s-out-iface").value, ttl: Number($("s-ttl").value), dscp: Number($("s-dscp").value),
+    read_delay_ms: Number($("s-read").value), mtu: Number($("s-mtu").value), pace: $("s-pace").checked };
+  try { await api("/api/st2110/output", { method: "POST", body: JSON.stringify(body) }); if (!tracking) trackJob(); }
+  catch (e) { startFailed("st2110-log", e.message); }
+});
+
+function showSt2110Status(st) {
+  const on = Object.values(st2110Cfg.out || {}).some((o) => o.enabled);
+  const live = st.age !== undefined && st.age < LIMITS.st2110StaleS;
+  $("s-state").textContent = !on ? "Off" : !live ? "Not reporting" : st.state === "error" ? "Error: " + (st.error || "") : st.state || "-";
+  $("s-src").textContent = live && st.src_ip ? `${st.src_ip} on ${st.iface}` : "-";
+  $("s-paced").textContent = live ? (st.paced ? "fq" : "bursts") : "-";
+  $("s-ref").textContent = live ? (st.gm ? "PTP " + st.gm : "local clock") : "-";
+  for (const k of ["A", "B"]) {
+    const el = $(`so-${k}-live`);
+    if (!el) continue;
+    const o = live && st.outputs ? st.outputs[k] : null;
+    el.textContent = o ? `${o.format || "waiting"} to ${o.dest}, ${(o.kbps / 1e6).toFixed(2)} Gb/s` : "-";
+  }
+}
+
+/* ---------- fabric ---------- */
+let fabricCfg = {}, fabricProv = "verbs";
+const FPROV_HELP = {
+  verbs: "RDMA over Converged Ethernet with the NIC's verbs provider. Needs an RDMA NIC, such as a ConnectX passed through to this VM, on both labs.",
+  tcp: "libfabric over plain TCP. Works on any NIC, including a virtual one. Use it to check the setup before RoCEv2, or to compare.",
+};
+const SESSION_STATE = { running: "Running", starting: "Starting", exited: "Stopped" };
+
+function showFabricPick() {
+  document.querySelectorAll("[data-fprov]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.fprov === fabricProv)));
+  $("fprov-help").textContent = FPROV_HELP[fabricProv];
+}
+document.querySelectorAll("[data-fprov]").forEach((b) => b.addEventListener("click", () => { fabricProv = b.dataset.fprov; showFabricPick(); }));
+
+async function loadFabric() {
+  const r = await api("/api/fabric");
+  fabricCfg = r.settings;
+  fabricProv = fabricCfg.provider;
+  $("f-enabled").checked = !!fabricCfg.enabled;
+  $("f-iface").innerHTML = ifaceOptions(r.ifaces, fabricCfg.iface, r.default_iface, false);
+  $("f-port").value = fabricCfg.base_port;
+  $("f-peer-url").value = fabricCfg.peer_url;
+  $("f-peer-user").value = fabricCfg.peer_user;
+  $("f-peer-pass").placeholder = fabricCfg.has_password ? "unchanged" : "none";
+  $("f-ifaces").textContent = (r.runner || {}).interfaces || "Shown once the fabric is on.";
+  showFabricPick();
+  showRoutePick();
+}
+
+$("f-apply").addEventListener("click", async () => {
+  const body = { enabled: $("f-enabled").checked, provider: fabricProv, iface: $("f-iface").value,
+    base_port: Number($("f-port").value), peer_url: $("f-peer-url").value.trim(),
+    peer_user: $("f-peer-user").value.trim(), peer_password: $("f-peer-pass").value };
+  try { await api("/api/fabric/apply", { method: "POST", body: JSON.stringify(body) }); $("f-peer-pass").value = ""; if (!tracking) trackJob(); }
+  catch (e) { startFailed("fabric-log", e.message); }
+});
+$("f-test").addEventListener("click", async () => {
+  const box = $("fabric-log");
+  box.hidden = false;
+  try {
+    const p = await api("/api/fabric/test", { method: "POST" });
+    box.className = "joblog " + (p.ok ? "ok" : "failed");
+    box.textContent = p.ok
+      ? `Peer ${p.info.host} answers. Fabric ${p.info.enabled ? "on, " + p.info.provider + " at " + (p.info.node || "no address") : "off"}. `
+        + `It sends ${p.info.sends.map((k) => FLOW_LABEL[k]).join(", ") || "nothing"} and expects ${p.info.expects.map((k) => FLOW_LABEL[k]).join(", ") || "nothing"}.`
+      : p.error;
+  } catch (e) { box.className = "joblog failed"; box.textContent = e.message; }
+});
+$("f-repair").addEventListener("click", async () => {
+  try { await api("/api/fabric/repair", { method: "POST" }); } catch (e) { startFailed("fabric-log", e.message); }
+});
+
+function peerMismatch(f) {
+  const info = (f.peer || {}).info;
+  if (!info) return [];
+  const out = [];
+  const expects = new Set(info.expects), sends = new Set(info.sends);
+  for (const k of routing.send || []) if (!expects.has(k)) out.push(`This lab sends ${FLOW_LABEL[k]}, but the peer does not expect it.`);
+  const mine = [...(routing.input === "peer" ? ["A", "audio"] : []), ...(routing.flow_b === "peer" ? ["B"] : [])];
+  for (const k of mine) if (!sends.has(k)) out.push(`This lab expects ${FLOW_LABEL[k]} from the peer, but the peer does not send it.`);
+  return out;
+}
+
+function showFabricStatus(f) {
+  const peer = f.peer || {};
+  $("f-state").textContent = !f.enabled ? "Off" : f.state === "on" ? `On, ${f.provider}` : f.state || "Not reporting";
+  $("f-node").textContent = f.node || "-";
+  $("f-peer").textContent = peer.ok ? `${peer.info.host}, ${peer.info.node || "no fabric address"}` : peer.ok === false ? "Not answering" : "-";
+  const rows = Object.values(f.sessions || {});
+  $("f-sessions").innerHTML = `<tr><th>Flow</th><th>Direction</th><th>State</th><th>Rate</th><th>Starts</th></tr>` + (rows.length
+    ? rows.map((s) => `<tr><td>${FLOW_LABEL[s.key]}</td><td>${s.role === "tx" ? "To the peer" : "From the peer"}</td>`
+      + `<td>${SESSION_STATE[s.state] || esc(s.state)}</td><td>${s.rate == null ? "-" : s.rate.toFixed(1) + " /s"}</td><td>${s.starts}</td></tr>`).join("")
+    : `<tr class="empty"><td colspan="5">No flows on the fabric</td></tr>`);
+  if (activeTab === "routing") {
+    api("/api/fabric").then((r) => {
+      const box = $("f-log");
+      box.textContent = (r.log || []).join("\n") || "Nothing yet.";
+      box.scrollTop = box.scrollHeight;
+      if ((r.runner || {}).interfaces) $("f-ifaces").textContent = r.runner.interfaces;
+    }).catch(() => {});
+  }
+}
+
 /* ---------- tabs ---------- */
-const TABS = ["status", "ndi", "framing", "audio"];
+const TABS = ["status", "ndi", "framing", "audio", "st2110", "routing"];
 let activeTab = "status";
 let lastPtpHist = [];
 
@@ -831,7 +1090,7 @@ window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 /* ---------- status overview ---------- */
 const RANK = { off: 0, ok: 1, busy: 2, warn: 3, fault: 4 };
 const worse = (a, b) => (RANK[b] > RANK[a] ? b : a);
-const AREA_TAB = { ndi: "ndi", framing: "framing", audio: "audio", clock: "audio", general: "status" };
+const AREA_TAB = { ndi: "ndi", framing: "framing", audio: "audio", clock: "audio", st2110: "st2110", fabric: "routing", general: "status" };
 const MEDIA = ["ndi-ingest", "autoframe", "ndi-out-original", "ndi-out-vertical"];
 const MODE_LABEL = { weighted: "Follow group", largest: "Follow nearest", manual: "Manual", hold: "Hold" };
 
@@ -858,20 +1117,28 @@ function findProblems() {
 
   const j = status.job || {};
   if (j.running) {
-    const area = { pipeline: "ndi", discovery: "ndi", audio: "audio", ptp: "clock" }[j.kind] || "general";
+    const area = { pipeline: "ndi", discovery: "ndi", audio: "audio", ptp: "clock", st2110in: "st2110", st2110: "st2110", routing: "fabric", fabric: "fabric" }[j.kind] || "general";
     add("busy", area, "Applying changes: " + ((j.log || []).slice(-1)[0] || "starting").replace(/^\S+\s+/, ""));
   }
 
-  // NDI and media chain
-  if (!pipeline.NDI_SRC) add("warn", "ndi", "No NDI source selected. Pick one on the NDI tab.");
+  // Media chain, as the routing sets it up
+  const r = status.routing || routing;
+  const expected = new Set([...(["ndi", "st2110"].includes(r.input) ? ["ndi-ingest"] : []),
+    ...(r.flow_b === "local" ? ["autoframe"] : []), ...(r.ndi_out_original ? ["ndi-out-original"] : []), ...(r.ndi_out_vertical ? ["ndi-out-vertical"] : [])]);
+  if (r.input === "ndi" && !pipeline.NDI_SRC) add("warn", "ndi", "No NDI source selected. Pick one on the NDI tab.");
+  else if (r.input === "st2110" && !(st2110Cfg.in_video_sdp || "").trim()) add("warn", "st2110", "The input is ST 2110 but there is no video SDP. Paste it on the ST 2110 tab.");
   else if (!j.running) {
     for (const svc of MEDIA) {
       const c = cs[svc];
+      if (!expected.has(svc)) continue;
       if (c && c.status !== "running" && c.status !== "unknown")
         add(["restarting", "created"].includes(c.status) ? "warn" : "fault", svc === "ndi-ingest" ? "ndi" : "framing",
           `${FN_LABEL[svc]}: ${fnText(svc, c)}`);
     }
-    if (running("ndi-ingest") && flows.A && !flows.A.exists) add("fault", "ndi", "Flow A is not present, so ingest is not receiving video.");
+    if (expected.has("ndi-ingest") && running("ndi-ingest") && flows.A && !flows.A.exists)
+      add("fault", r.input === "st2110" ? "st2110" : "ndi", "Flow A is not present, so ingest is not receiving video.");
+    if (r.input === "peer" && flows.A && !flows.A.exists) add("fault", "fabric", "Flow A has not arrived from the peer.");
+    if (r.flow_b === "peer" && flows.B && !flows.B.exists) add("warn", "fabric", "Flow B has not arrived from the peer.");
     if (running("autoframe") && flows.B && !flows.B.exists) add("fault", "framing", "Flow B is not present, so the vertical output has no picture.");
     if (running("autoframe") && !(af.age < LIMITS.autoframeStaleS)) add("warn", "framing", "Autoframe is running but has not reported recently.");
     const fps = af.fps;
@@ -893,6 +1160,31 @@ function findProblems() {
     if (live && a.latency_ms != null && a.latency_ms > LIMITS.sendLagWarnMs)
       add("warn", "audio", `Packets leave ${a.latency_ms} ms after their timestamp. Receivers need more latency than that.`);
     if (mode === "off") add("warn", "clock", "AES67 output is on but PTP is off, so PTP-locked receivers will drift against it.");
+  }
+
+  // ST 2110 out
+  const st = status.st2110 || {};
+  if (Object.values(st2110Cfg.out || {}).some((o) => o.enabled) && !j.running) {
+    if (!running("st2110-out")) add("fault", "st2110", "ST 2110 video output is turned on but its function is not running.");
+    else if (!(st.age < LIMITS.st2110StaleS)) add("fault", "st2110", "ST 2110 video output is not reporting.");
+    else if (st.state === "error") add("fault", "st2110", "ST 2110 output error: " + (st.error || "unknown"));
+    else if (st.state === "waiting") add("warn", "st2110", "ST 2110 output is waiting for its flow.");
+    if (mode === "off") add("warn", "clock", "ST 2110 output is on but PTP is off, so receivers cannot lock to it.");
+  }
+
+  // Fabric
+  const f = status.fabric || {};
+  const wantsFabric = (r.send || []).length || r.input === "peer" || r.flow_b === "peer";
+  if (wantsFabric && !f.enabled) add("warn", "fabric", "The routing sends or receives flows over the fabric, but the fabric is off.");
+  else if (f.enabled && !j.running) {
+    if (!running("fabric")) add("fault", "fabric", "The fabric is on but its function is not running.");
+    else if (!(f.age < LIMITS.fabricStaleS)) add("fault", "fabric", "The fabric function is not reporting.");
+    else if (f.state !== "on") add("fault", "fabric", "Fabric: " + f.state);
+    if (f.peer && f.peer.ok === false) add("fault", "fabric", "The peer lab is not answering: " + f.peer.error);
+    for (const s of Object.values(f.sessions || {}))
+      if (s.state === "exited") add("warn", "fabric", `${FLOW_LABEL[s.key]} ${s.role === "tx" ? "to" : "from"} the peer stopped. It pairs again by itself.`);
+    for (const m of peerMismatch(f)) add("warn", "fabric", m);
+    if (wantsFabric && mode === "off") add("warn", "clock", "Flows cross the fabric with the sender's timestamps, so both labs need PTP.");
   }
 
   // PTP
@@ -943,17 +1235,23 @@ function updateOverview() {
     framing: areaHealth(items, ["framing"], running("autoframe")),
     audio: areaHealth(items, ["audio"], audioCfg.enabled && running("aes67-out")),
     clock: areaHealth(items, ["clock"], mode && mode !== "off" && ["SLAVE", "MASTER", "GRAND_MASTER"].includes(ps.port_state)),
+    st2110: areaHealth(items, ["st2110"], running("st2110-out") || (status.routing || {}).input === "st2110"),
+    fabric: areaHealth(items, ["fabric"], (status.fabric || {}).enabled && running("fabric")),
   };
   const all = items.reduce((acc, i) => worse(acc, i.lvl), Object.values(h).some((v) => v === "ok") ? "ok" : "off");
   const set = (id, v) => $(id).setAttribute("data-h", v);
   set("dot-status", all);
   set("dot-ndi", h.ndi); set("dot-framing", h.framing);
   set("dot-audio", worse(h.audio, h.clock));
+  set("dot-st2110", h.st2110); set("dot-routing", h.fabric);
   set("dot-ov-ndi", h.ndi); set("dot-ov-framing", h.framing);
   set("dot-ov-audio", h.audio); set("dot-ov-clock", h.clock);
 
   // NDI card
-  $("ov-src").textContent = pipeline.NDI_SRC ? pipeline.NDI_SRC + (pipeline.NDI_URL ? " at " + pipeline.NDI_URL : "") : "None selected";
+  const rin = (status.routing || routing).input;
+  $("ov-src").textContent = rin === "st2110" ? "ST 2110 " + ($("s-vsum").textContent || "")
+    : rin === "peer" ? "From the peer lab" : rin === "none" ? "No input on this lab"
+    : pipeline.NDI_SRC ? pipeline.NDI_SRC + (pipeline.NDI_URL ? " at " + pipeline.NDI_URL : "") : "None selected";
   $("ov-fmt").textContent = pipeline.SRC_W ? `${pipeline.SRC_W}x${pipeline.SRC_H} at ${fpsLabel(pipeline.SRC_FPS)}` + (pipeline.SRC_AUTO ? ", auto" : "") : "-";
   $("ov-disc").textContent = { mdns: "mDNS", local: "Internal server", external: "External server " + (disc.servers || "") }[disc.mode] || "-";
   $("ov-ingest").textContent = cs["ndi-ingest"] ? fnText("ndi-ingest", cs["ndi-ingest"]) : "-";
@@ -991,6 +1289,9 @@ function updateOverview() {
   await loadDiscovery();
   await loadPtp().catch((e) => { $("p-current").textContent = e.message; });
   await loadAudio().catch((e) => startFailed("audio-log", e.message));
+  await loadRouting().catch((e) => startFailed("routing-log", e.message));
+  await loadSt2110().catch((e) => startFailed("st2110in-log", e.message));
+  await loadFabric().catch((e) => startFailed("fabric-log", e.message));
   poll();
   setInterval(poll, 1000);
   previewLoop();

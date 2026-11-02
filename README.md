@@ -1,10 +1,10 @@
-# MXL Lab
+# MXL Lab Fabric
 
-A self-contained lab for the [Media eXchange Layer (MXL)](https://github.com/dmf-mxl/mxl). It takes an NDI source, passes its video and audio through MXL shared-memory flows, crops the picture to a 9:16 vertical frame that follows faces, and sends the results back out: both pictures as NDI, and the audio as an AES67 stream that Dante and ST 2110-30 receivers can subscribe to. A PTP function keeps the audio timing aligned with the rest of the network. A web GUI for control.
+A self-contained lab for the [Media eXchange Layer (MXL)](https://github.com/dmf-mxl/mxl). It takes an NDI or ST 2110 source, passes its video and audio through MXL flows, crops the picture to a 9:16 vertical frame that follows faces, and sends the results back out: the pictures as NDI and ST 2110-20, and the audio as an AES67 stream that Dante and ST 2110-30 receivers can subscribe to. A PTP function keeps the timing aligned with the rest of the network. A web GUI for control.
 
-It runs as Docker containers on a single Ubuntu VM, and one script takes a fresh VM to a working lab.
+Each lab runs as Docker containers on one Ubuntu VM, and one script takes a fresh VM to a working lab. Two labs can be joined with **MXL fabrics over RoCEv2**: any flow made in one lab can be written straight into the other lab's memory by the NIC, so the media functions can be split across two machines the way a real facility splits them across compute nodes.
 
-This is a fork of [mykeman/MXL-Lab](https://github.com/mykeman/MXL-Lab). It adds the MXL audio flow, AES67 output, PTP timing, and a tabbed GUI with a status overview.
+This builds on [mykeman/MXL-Lab](https://github.com/mykeman/MXL-Lab). It adds ST 2110-20/30 input, ST 2110-20 video output, and the fabric link between two labs, using the fabrics library that is part of MXL.
 
 This is a lab and learning tool, not a production system. See [Security](#security) before putting it on a shared network.
 
@@ -16,6 +16,8 @@ This is a lab and learning tool, not a production system. See [Security](#securi
 - [Install](#install)
 - [First run](#first-run)
 - [Audio and PTP](#audio-and-ptp)
+- [ST 2110](#st-2110)
+- [Two labs over RoCEv2](#two-labs-over-rocev2)
 - [Manual install](#manual-install)
 - [Testing](#testing)
 - [NDI discovery](#ndi-discovery)
@@ -47,19 +49,43 @@ flowchart LR
     GUI -. tunes .-> AF
 ```
 
+Any of the flows can also come from, or go to, a second lab over the fabric. One way to split the work:
+
+```mermaid
+flowchart LR
+    subgraph L1["Lab 1 VM"]
+      IN1["ingest<br>NDI or ST 2110"] --> A1[("Flow A")]
+      IN1 --> X1[("audio flow")]
+      RX1["fabric<br>target"] --> B1[("Flow B")] --> O1["ndi-out-vertical<br>st2110-out"]
+      A1 --> TX1["fabric<br>initiator"]
+      X1 --> TX1
+    end
+    subgraph L2["Lab 2 VM"]
+      RX2["fabric<br>target"] --> A2[("Flow A")]
+      RX2 --> X2[("audio flow")]
+      A2 --> AF2["autoframe"] --> B2[("Flow B")]
+      X2 --> AES2["aes67-out"]
+      B2 --> TX2["fabric<br>initiator"]
+    end
+    TX1 == "RoCEv2<br>RDMA write" ==> RX2
+    TX2 == "RoCEv2<br>RDMA write" ==> RX1
+```
+
 Each box is its own container. They share media through MXL flows in `/dev/shm/mxl`, so frames and samples move between them without being copied over the network or re-encoded.
 
-- **ndi-ingest** receives the NDI source and writes its video to MXL Flow A and its audio to the MXL audio flow.
+- **ndi-ingest** receives the NDI source, or an ST 2110-20 video and ST 2110-30 audio stream, and writes the video to MXL Flow A and the audio to the MXL audio flow.
 - **autoframe** reads Flow A, finds faces with the YuNet model in OpenCV, and moves a 9:16 crop window to follow them. The result goes to Flow B. All pixel work stays in GStreamer; Python only moves the crop.
 - **ndi-out-original** and **ndi-out-vertical** send Flow A and Flow B out as NDI.
 - **aes67-out** reads the audio flow and sends it as an AES67 or ST 2110-30 multicast stream, with an SDP file and SAP announcements. It can also send a test tone. Off until you turn it on.
+- **st2110-out** reads Flow A and/or Flow B and sends each as ST 2110-20 (4:2:2 10 bit) multicast, with an SDP file. Off until you turn it on.
+- **fabric** moves flows to and from the other lab with MXL fabrics: one `mxl-fabrics-demo` process per flow, as a target (receiving) or an initiator (sending). Off until you turn it on.
 - **ptp** runs ptp4l so the VM's clock follows the network's PTP grandmaster, or acts as one. Off until you turn it on.
 - **gui** is the web page for all of the above.
 - **ndi-discovery** is an optional NDI Discovery Server, for networks that don't use mDNS.
 
 ## The web GUI
 
-Open `http://<vm-ip>:8080` once the lab is running. The page has four tabs. Each has a status dot: green when everything in it is running, amber for a warning or while a change is being applied, red for a fault, grey when it is turned off. The lamps in the header show every function from any tab.
+Open `http://<vm-ip>:8080` once the lab is running. The page has six tabs. Each has a status dot: green when everything in it is running, amber for a warning or while a change is being applied, red for a fault, grey when it is turned off. The lamps in the header show every function from any tab.
 
 **Status** is the page to leave open while the lab runs. A **Needs attention** list shows anything wrong, worst first, with a link to the tab that fixes it. Summary cards cover the NDI source, the framing, the audio output (with small level meters) and the PTP clock. Below them are the MXL flow rates and the list of functions, with logs and restart buttons.
 
@@ -69,7 +95,11 @@ Open `http://<vm-ip>:8080` once the lab is running. The page has four tabs. Each
 
 **AES67 and clock** has the audio output on one side and PTP timing on the other. The audio side shows level meters, where the stream goes and how late packets leave, and sets the stream format, network settings and SAP. It also offers the SDP file for download. The PTP side shows the port state, the offset from the grandmaster with a two-minute graph, and the grandmaster's details, and sets the role, profile and every main ptp4l setting.
 
-The address bar keeps the tab (`#status`, `#ndi`, `#framing`, `#audio`), so a reload or bookmark opens the same one.
+**ST 2110** has the ST 2110 input (paste the senders' SDP files, checked as you type) and the ST 2110-20 video outputs for Flow A and Flow B, each with its own multicast address and SDP download.
+
+**Routing and fabric** sets where each flow comes from on this lab (NDI, ST 2110, the peer lab or nothing for Flow A; autoframe here, the peer or nothing for Flow B), which flows go to the peer, and the fabric link itself. It shows each flow on the link, its direction and rate, and a pairing log.
+
+The address bar keeps the tab (`#status`, `#ndi`, `#framing`, `#audio`, `#st2110`, `#routing`), so a reload or bookmark opens the same one.
 
 ## Requirements
 
@@ -85,6 +115,11 @@ For audio into Dante or ST 2110 devices you also need:
 - Multicast working on that VLAN. With IGMP snooping on, the VLAN needs an IGMP querier.
 - A PTP grandmaster on the network, or the lab acting as one.
 - Optionally, a network card with hardware timestamping passed through to the VM. It works without one, but timing is much tighter with one. See [Hardware timestamping](#hardware-timestamping).
+
+For two labs joined by RoCEv2 you also need:
+
+- An RDMA NIC port in each VM, such as one port of a Mellanox/NVIDIA ConnectX-4 or later passed through from Proxmox. See [Two labs over RoCEv2](#two-labs-over-rocev2).
+- Both ports on the same Ethernet network (a switch, or a direct cable), with an IPv4 address each.
 
 You will be asked to accept the NDI SDK licence during setup. The NDI SDK is not part of this repository.
 
@@ -201,6 +236,92 @@ Check the host's card with `ethtool -T <nic>`: it should list `hardware-transmit
 6. In the GUI, choose it as the PTP and Audio out interface, set Timestamping to **Hardware**, and apply.
 
 Connect the port to a single switch port, not a port-channel. The switch should either pass PTP through or act as a boundary clock on that port.
+
+## ST 2110
+
+### Input
+
+On the **ST 2110** tab, paste the video sender's SDP, and optionally the audio sender's SDP, choose the interface the streams arrive on, and click **Apply input**. Then choose **ST 2110** as the input on the **Routing and fabric** tab. The lab takes the format from the SDP, so there is nothing else to set.
+
+- Video must be ST 2110-20, YCbCr 4:2:2, 8 or 10 bit, progressive, landscape. With an SDP for two redundant streams (ST 2022-7) the first is used.
+- Audio must be ST 2110-30, L24 or L16 at 48 kHz. Its channels are mapped to the audio flow's channel count, as with NDI.
+- With a `source-filter` line in the SDP, and GStreamer 1.24 or later in the image, the lab joins the group for that source only (SSM).
+
+The streams are received with ordinary kernel sockets. A 1080p50 stream is about 2.6 Gb/s in 220,000 packets a second, which is a lot of work for one CPU core. `setup.sh` raises the kernel's socket buffer limit so the ingest can ask for a 256 MB buffer. Lost packets show up as damaged lines rather than as an error, so watch the picture, and the ingest log, when trying a new sender. 720p, or a 25 or 30 fps source, is an easier start. Open the stream's UDP port if `ufw` is active.
+
+### Video output
+
+Tick **Send Flow A** and/or **Send Flow B**, give each a multicast address, and click **Apply video out**. Download each stream's SDP for the receiver or a broadcast controller. The SDP carries the PTP grandmaster as its reference clock, as the AES67 output does.
+
+The sender works like the AES67 one: RTP timestamps are each grain's MXL time on the 90 kHz media clock, so with PTP on they are PTP time, and each frame leaves a fixed **read delay** after its timestamp. The read delay must cover how late frames reach MXL, which includes a hop over the fabric when the flow comes from the peer.
+
+**Pacing.** Without it, each frame's packets leave as a burst. Software receivers and most lab tools accept that; strict ST 2110-21 receivers may count it as a violation. **Pace packets with the fq qdisc** replaces the output interface's root qdisc with `fq`, capped a little above each stream's rate, which spreads the packets out. It is closer to 2110-21 than bursts, but not a compliant narrow or wide sender. Turning it off removes the qdisc on the next start.
+
+## Two labs over RoCEv2
+
+### What happens
+
+[MXL fabrics](https://github.com/dmf-mxl/mxl/blob/main/docs/FabricsGettingStarted.md) moves flows between hosts with libfabric. With the **verbs** provider on a ConnectX card, that is RDMA over Converged Ethernet v2: the sending lab's NIC writes each grain straight into the receiving lab's MXL ring buffer, without the receiving CPU taking part. The receiving lab then has the flow in its own `/dev/shm/mxl`, and its functions read it exactly as if it were made locally.
+
+For each flow on the link:
+
+1. The sending lab's GUI posts the flow definition to the receiving lab's GUI.
+2. The receiving GUI stops whatever reads that flow, has its fabric function start a **target**, which creates the flow, and replies with the target's fabric address and memory keys.
+3. The sending GUI hands those to its fabric function, which starts an **initiator** that reads the local flow and writes every grain to the target.
+
+A watchdog on each side keeps it so. A sender pairs again whenever its flow is recreated, and a receiver asks the sender to pair again whenever it lacks a target for a flow it expects. Restarting either lab, or any function, heals the link within about ten seconds.
+
+Grains keep their sender's timestamps. Both labs therefore need PTP from the same grandmaster, or one following the other.
+
+### Passing a ConnectX port to each VM
+
+A dual-port ConnectX-4 appears to Proxmox as two PCI functions, one per port, so each port can go to a different VM.
+
+1. Enable VT-d or AMD-Vi and load the VFIO modules on the host, as in [Hardware timestamping](#hardware-timestamping).
+2. Find both ports: `lspci -nn | grep -i mellanox` lists two functions, such as `01:00.0` and `01:00.1`. Check each is in its own IOMMU group with `find /sys/kernel/iommu_groups/ -type l | grep 01:00`. If both share a group, the slot has no ACS; move the card, or use SR-IOV virtual functions instead.
+3. Remove both ports from any host bridge or bond. Add `01:00.0` to the first VM and `01:00.1` to the second as **Raw Device** PCI devices, with **PCI-Express** ticked on a q35 machine type. Stop and start each VM.
+4. In each VM, `ip link` shows the new interface (such as `ens16np0`) and `ls /sys/class/infiniband` shows `mlx5_0`. `setup.sh` checks this. If the interface is there but the RDMA device is not, run `sudo modprobe mlx5_ib`.
+5. Give each port an address on the fabric network, with no gateway, and an MTU of 9000. With netplan:
+   ```yaml
+   network:
+     ethernets:
+       ens16np0:
+         addresses: [10.50.0.11/24]
+         mtu: 9000
+   ```
+6. Check RDMA works before using the lab, with `perftest` (in the image): on lab 2, `docker compose exec fabric ib_write_bw -d mlx5_0 --report_gbits`; on lab 1, the same with lab 2's address at the end. You should see close to the link speed.
+
+The same ports can carry PTP with hardware timestamps, and ST 2110: choose them as the PTP, ST 2110 and AES67 interfaces.
+
+### The switch
+
+With both ports on a switch:
+
+- Put them in one VLAN, with an MTU of 9216 on the switch ports. RoCEv2 uses UDP port 4791.
+- RoCEv2 prefers a lossless network. The lab's traffic, a few Gb/s on a 25 or 100 Gb/s link, rarely congests, so it works without, but loss shows as stalled transfers and restarts. For lossless operation, enable PFC on one priority and map RoCE to it by DSCP on both the switch and the NICs. MXL's [fabrics guide](https://github.com/dmf-mxl/mxl/blob/main/docs/FabricsGettingStarted.md#7-rocev2-qos-configuration) shows the NIC side with DSCP 26 and priority 3; on ConnectX-4 with the inbox driver, `mlnx_qos` is not available and `dcb` from iproute2 does the same.
+- If the switch is also a PTP boundary clock, the labs follow it directly. Otherwise make one lab the grandmaster (**Can be grandmaster**) and the other **Follow only**.
+
+A direct cable between the two ports also works, with no switch and no QoS to set.
+
+### Setting up the link
+
+On **each** lab, in **Routing and fabric**:
+
+1. Tick **Use the fabric**, choose **RoCEv2 (verbs)** and the ConnectX interface, and set **Peer GUI address** to the other lab's GUI, such as `http://10.40.0.12:8080`. If the other GUI has a login, fill in Peer login and password. Click **Apply fabric**, then **Test peer**.
+2. Set the routing. For example, ingest on lab 1 and autoframe on lab 2, with the vertical picture coming back to lab 1:
+
+   | | Lab 1 | Lab 2 |
+   |---|---|---|
+   | Flow A and audio come from | NDI (or ST 2110) | The peer |
+   | Flow B comes from | The peer | Autoframe here |
+   | Send to the peer | Flow A, Audio flow | Flow B |
+
+   Then click **Apply routing** on each. Order does not matter; whichever starts second pairs the flows.
+3. The session table shows each flow, its direction and rate. **Needs attention** lists routing that does not match between the labs, such as a flow one lab sends that the other does not expect.
+
+Use **TCP** instead of RoCEv2 to try the set-up on virtual NICs first, or to compare CPU use: the TCP provider moves the same flows through the kernel.
+
+Both labs must use the same flow ids, `FLOW_A`, `FLOW_B` and `FLOW_AUDIO` in `.env`, which they do unless you change them.
 
 ## Manual install
 
@@ -388,7 +509,7 @@ Settings live in `.env`. Choices made in the GUI are saved in `config/` and take
 | `FLOW_A`, `FLOW_B`, `FLOW_AUDIO` | fixed UUIDs | MXL flow IDs |
 | `UBUNTU_VERSION` | `24.04` | Ubuntu release for the container base |
 
-Audio and PTP are set in the GUI only, and saved in `config/audio.json` and `config/ptp.json`. The current SDP is written to `config/aes67.sdp`.
+Audio, PTP, ST 2110, routing and the fabric are set in the GUI only, and saved in `config/audio.json`, `config/ptp.json`, `config/st2110.json`, `config/routing.json` and `config/fabric.json`. The current SDPs are written to `config/aes67.sdp`, `config/st2110-A.sdp` and `config/st2110-B.sdp`.
 
 | Audio setting | Default | Meaning |
 |---|---|---|
@@ -400,6 +521,13 @@ Audio and PTP are set in the GUI only, and saved in `config/audio.json` and `con
 | Send delay | 1 ms | Added to the sender's own 1 ms of buffering. -1 sends packets at their timestamp |
 | SAP | on | Announce the stream so Dante Controller finds it |
 
+| Fabric setting | Default | Meaning |
+|---|---|---|
+| Provider | RoCEv2 (verbs) | `verbs` for RDMA NICs, `tcp` for any NIC |
+| Fabric interface | default route | The interface facing the other lab. Its IPv4 address is this lab's fabric address |
+| Base port | 47100 | Flow A, Flow B and audio targets listen on this port and the next two |
+| Peer GUI address | blank | The other lab's GUI, used to pair flows |
+
 `autoframe.py` and the `scripts/` folder are mounted into the containers, so changes to them only need a restart of the function, not a rebuild. The same goes for the GUI files in `gui/`.
 
 ## Project layout
@@ -407,8 +535,9 @@ Audio and PTP are set in the GUI only, and saved in `config/audio.json` and `con
 ```
 mxl-lab/
   setup.sh                 install script
-  Dockerfile               lab image: MXL, NDI and MXL GStreamer plugins, OpenCV, YuNet, linuxptp
-  docker-compose.yml       the eight containers
+  Dockerfile               lab image: MXL with fabrics, libfabric, rdma-core, NDI and MXL
+                           GStreamer plugins, OpenCV, YuNet, linuxptp
+  docker-compose.yml       the ten containers
   env.example              settings template, copied to .env
   autoframe.py             face tracking and 9:16 crop
   pyproject.toml           lint settings (ruff)
@@ -417,6 +546,10 @@ mxl-lab/
     run-out-original.sh    Flow A to NDI
     run-out-vertical.sh    Flow B to NDI
     aes67_out.py           audio flow to AES67 multicast, with SDP, SAP and level meters
+    st2110_in.py           ST 2110-20/30 to Flow A and the audio flow, from SDPs
+    st2110_out.py          Flow A and Flow B to ST 2110-20 multicast, with SDPs
+    run-fabric.py          one mxl-fabrics-demo target or initiator per flow on the link
+    media_common.py        routing, ST 2110 and fabric settings, and SDP parsing
     run-ptp.py             ptp4l and phc2sys from the GUI settings
     ptp_common.py          PTP, pmc and network helpers shared by the above and the GUI
     lab-apply.sh           ordered start of the media functions
@@ -428,7 +561,7 @@ mxl-lab/
     Dockerfile             GUI image, built on the lab image
     app.py                 HTTP API (FastAPI)
     lab/                   GUI backend: settings, NDI discovery, Docker control,
-                           status monitors, ordered apply jobs
+                           status monitors, ordered apply jobs, fabric pairing
     static/                the page: index.html, app.js, app.css
   ndi/                     NDI runtime, created by setup, never committed
   config/                  runtime settings and state, never committed
@@ -515,6 +648,8 @@ This is built for a lab network. Before running it anywhere else, note that:
 - The GUI container mounts the **Docker socket**, which gives it root-level control of the VM.
 - The NDI containers run with **AppArmor turned off** so mDNS works.
 - The ptp container runs **privileged**, so it can set the VM's clock and reach the network card's hardware clock.
+- The fabric container runs **privileged**, for the RDMA devices and locked memory. The st2110-out container can change the network's queueing (NET_ADMIN), for pacing.
+- Anyone who can reach a lab's GUI can ask it to receive a flow, and anyone on the fabric network who has a target's memory keys can write into its flow. MXL's keys are not a security measure; keep the fabric on its own VLAN.
 
 Keep the VM on a trusted VLAN and don't expose port 8080 to the internet. Two settings in `.env` reduce the exposure: `GUI_BIND` limits the GUI to one address, such as a management interface, and `GUI_USER` with `GUI_PASSWORD` turns on a login. The login keeps casual visitors out; it does not make the GUI safe to put on an untrusted network.
 
@@ -528,10 +663,17 @@ Keep the VM on a trusted VLAN and don't expose port 8080 to the internet. Two se
 - NDI audio arrives on the sender's clock, not PTP. Ingest keeps the audio flow continuous, so it occasionally inserts or drops a sample when the two drift apart. Expect a rare small glitch on long runs.
 - The thresholds behind the Status tab's warnings, such as 2.5 ms for late packets and 1 ms for PTP offset, are lab defaults rather than values from a standard. They are listed together at the top of `gui/static/app.js`.
 - There is no NMOS registration for the AES67 stream. Dante finds it through SAP; ST 2110 receivers need the SDP file.
+- ST 2110-20 is received and sent with kernel sockets in GStreamer, not a kernel-bypass stack. Output packets leave in bursts unless fq pacing is on, and even then the sender is not ST 2110-21 compliant. Input works best at 720p or 1080p25/30 on modest CPUs.
+- ST 2110 input is progressive 4:2:2 only, one stream of a 2022-7 pair, and has no NMOS IS-05 control; paste the SDPs.
+- The fabric uses `mxl-fabrics-demo` from MXL, one process per flow, rather than a purpose-built bridge. If a transfer stalls, the lab restarts and re-pairs that flow rather than recovering in place.
+- Each flow on the fabric goes to one peer. Fanning a flow out to several labs is not supported here, though MXL fabrics can.
+- The fabric and ST 2110 paths have been checked for correctness of settings and pairing logic, not yet on a pair of RoCE NICs end to end. See CHANGELOG.
 
 ## Credits and licence
 
 Built by [Rankin Network](https://rankin.network).
+
+RoCEv2 transport uses [libfabric](https://ofiwg.github.io/libfabric/) (BSD or GPLv2) and [rdma-core](https://github.com/linux-rdma/rdma-core) (BSD or GPLv2), both built into the image.
 
 Copyright 2026 Michael Rankin. Licensed under the [Apache License 2.0](LICENSE). You may use, change and share this project, including commercially, as long as you keep the copyright notice and licence, include the [NOTICE](NOTICE) file, and state which files you changed.
 

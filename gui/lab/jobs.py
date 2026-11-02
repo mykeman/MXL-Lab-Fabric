@@ -12,7 +12,18 @@ from datetime import UTC, datetime
 from fastapi import HTTPException
 
 from .docker_ctl import container
-from .settings import DOMAIN, FLOW_A, FLOW_AUDIO, FLOW_B, PIPELINE_CFG, pc, pipeline_settings, write_json_atomic
+from .settings import (
+    DOMAIN,
+    FLOW_A,
+    FLOW_AUDIO,
+    FLOW_B,
+    PIPELINE_CFG,
+    mc,
+    media_configured,
+    pc,
+    pipeline_settings,
+    write_json_atomic,
+)
 
 
 class ApplyJob:
@@ -20,11 +31,16 @@ class ApplyJob:
     Runs one change at a time in the background and keeps a log for the page.
 
     A change is an optional first step (write settings, restart PTP), then
-    either a full ordered restart of the media functions or, when there is no
-    NDI source yet, just the AES67 output.
+    either a full ordered restart of the media functions or, when there is
+    nothing to start yet, just the AES67 or ST 2110 output.
+
+    The restart follows routing.json: Flow A and the audio flow come from the
+    NDI or ST 2110 ingest, or from the peer over the fabric; Flow B from
+    autoframe or the peer. Flows sent to the peer are paired once they exist.
     """
 
-    MEDIA_STOP = ("aes67-out", "ndi-out-vertical", "ndi-out-original", "autoframe", "ndi-ingest")
+    MEDIA_STOP = ("aes67-out", "st2110-out", "ndi-out-vertical", "ndi-out-original", "autoframe", "ndi-ingest")
+    PEER_WAIT_S = 40
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -32,29 +48,33 @@ class ApplyJob:
         self.log = []
         self.result = None
         self.kind = "pipeline"
+        self.fabric = None      # FabricLink, set by app.py
 
     def _say(self, msg):
         self.log.append(f"{time.strftime('%H:%M:%S')}  {msg}")
 
     def _wait_flow(self, flow_id, timeout=15):
+        """Whether the flow is in the domain, waiting up to timeout seconds. 0 checks once."""
         path = os.path.join(DOMAIN, f"{flow_id}.mxl-flow")
         end = time.time() + timeout
-        while time.time() < end:
+        while True:
             if os.path.isdir(path):
                 return True
+            if time.time() >= end:
+                return False
             time.sleep(0.5)
-        return False
 
-    def start(self, settings, first=None, kind="pipeline", audio=False):
+    def start(self, settings, first=None, kind="pipeline", audio=False, st2110=False):
         """
         settings None means no media restart. With audio=True the AES67
-        output is then restarted (or stopped) on its own.
+        output, and with st2110=True the ST 2110 output, is then restarted
+        (or stopped) on its own.
         """
         with self.lock:
             if self.running:
                 raise HTTPException(409, "a change is already being applied")
             self.running, self.log, self.result, self.kind = True, [], None, kind
-        threading.Thread(target=self._run, args=(settings, first, audio), daemon=True).start()
+        threading.Thread(target=self._run, args=(settings, first, audio, st2110), daemon=True).start()
 
     def _audio_only(self):
         c = container("aes67-out")
@@ -67,12 +87,41 @@ class ApplyJob:
         else:
             self._say("AES67 output is off")
 
+    def _st2110_only(self):
+        c = container("st2110-out")
+        if c.status == "running":
+            c.stop(timeout=5)
+            self._say("Stopped st2110-out")
+        if any(o["enabled"] for o in mc.st2110_settings()["out"].values()):
+            c.start()
+            self._say("Started st2110-out")
+        else:
+            self._say("ST 2110 output is off")
+
+    def _from_peer(self, keys):
+        """Ask the peer for flows and wait for them. Returns the keys that arrived."""
+        if not mc.fabric_settings()["enabled"]:
+            raise RuntimeError("Routing expects flows from the peer, but the fabric is off. "
+                               "Turn it on in the Routing tab.")
+        self.fabric.request(keys, self._say)
+        names = ", ".join(mc.FLOW_NAMES[k] for k in keys)
+        self._say(f"Waiting up to {self.PEER_WAIT_S} s for {names} from the peer")
+        end, got = time.time() + self.PEER_WAIT_S, []
+        while time.time() < end:
+            got = [k for k in keys if os.path.isdir(os.path.join(DOMAIN, f"{mc.FLOW_IDS[k]}.mxl-flow"))]
+            if len(got) == len(keys):
+                break
+            time.sleep(0.5)
+        return got
+
     def _restart_media(self, settings):
         write_json_atomic(PIPELINE_CFG, settings)
         self._say("Saved pipeline settings")
         for svc in self.MEDIA_STOP:
             container(svc).stop(timeout=5)
             self._say(f"Stopped {svc}")
+        # Fabric sessions hold flows in the domain; close them before clearing it
+        self.fabric.clear(self._say)
 
         removed = 0
         for entry in os.listdir(DOMAIN):
@@ -84,31 +133,63 @@ class ApplyJob:
             removed += 1
         self._say(f"Cleared MXL domain ({removed} entries)")
 
-        container("ndi-ingest").start()
-        self._say("Started ndi-ingest, waiting for Flow A")
-        if not self._wait_flow(FLOW_A):
-            raise RuntimeError("Flow A did not appear. Check the ndi-ingest log and the source name.")
-        self._say("Flow A is up")
-        if self._wait_flow(FLOW_AUDIO, timeout=5):
-            self._say("Audio flow is up")
+        r = mc.routing_settings()
+        if r["input"] in ("ndi", "st2110"):
+            container("ndi-ingest").start()
+            label = "NDI" if r["input"] == "ndi" else "ST 2110"
+            self._say(f"Started ndi-ingest ({label}), waiting for Flow A")
+            if not self._wait_flow(FLOW_A):
+                hint = "the source name" if r["input"] == "ndi" else "the SDP, the interface and multicast"
+                raise RuntimeError(f"Flow A did not appear. Check the ndi-ingest log and {hint}.")
+            self._say("Flow A is up")
+            if self._wait_flow(FLOW_AUDIO, timeout=5):
+                self._say("Audio flow is up")
+            else:
+                self._say("No audio flow yet. The source may not be sending audio. Carrying on.")
+        elif r["input"] == "peer":
+            got = self._from_peer(["A", "audio"] if r["flow_b"] != "peer" else ["A", "audio", "B"])
+            if "A" not in got:
+                raise RuntimeError("Flow A did not arrive from the peer. Check the peer's routing "
+                                   "sends Flow A, and the fabric log on both labs.")
+            self._say("Flow A is up, from the peer")
+            if "audio" in got:
+                self._say("Audio flow is up, from the peer")
         else:
-            self._say("No audio flow yet. The source may not be sending audio. Carrying on.")
+            self._say("No input on this lab")
+        a_up = self._wait_flow(FLOW_A, timeout=0)
 
-        container("ndi-out-original").start()
-        self._say("Started ndi-out-original")
-        container("autoframe").start()
-        self._say("Started autoframe, waiting for Flow B")
-        if not self._wait_flow(FLOW_B):
-            raise RuntimeError("Flow B did not appear. Check the autoframe log.")
-        self._say("Flow B is up")
+        if a_up and r["ndi_out_original"]:
+            container("ndi-out-original").start()
+            self._say("Started ndi-out-original")
 
-        container("ndi-out-vertical").start()
-        self._say("Started ndi-out-vertical")
+        b_up = False
+        if r["flow_b"] == "local":
+            if not a_up:
+                raise RuntimeError("Autoframe needs Flow A, and there is none. Check the routing.")
+            container("autoframe").start()
+            self._say("Started autoframe, waiting for Flow B")
+            if not self._wait_flow(FLOW_B):
+                raise RuntimeError("Flow B did not appear. Check the autoframe log.")
+            self._say("Flow B is up")
+            b_up = True
+        elif r["flow_b"] == "peer":
+            b_up = self._wait_flow(FLOW_B, timeout=0) or "B" in self._from_peer(["B"])
+            self._say("Flow B is up, from the peer" if b_up else
+                      "Flow B did not arrive from the peer yet. It will be picked up when it does.")
+
+        if b_up and r["ndi_out_vertical"]:
+            container("ndi-out-vertical").start()
+            self._say("Started ndi-out-vertical")
+        if r["send"]:
+            self.fabric.sync(self._say)
+        if any(o["enabled"] for o in mc.st2110_settings()["out"].values()):
+            container("st2110-out").start()
+            self._say("Started st2110-out")
         if pc.audio_settings()["enabled"]:
             container("aes67-out").start()
             self._say("Started aes67-out")
 
-    def _run(self, settings, first=None, audio=False):
+    def _run(self, settings, first=None, audio=False, st2110=False):
         try:
             if first is not None:
                 first(self._say)
@@ -116,6 +197,8 @@ class ApplyJob:
                 self._restart_media(settings)
             elif audio:
                 self._audio_only()
+            elif st2110:
+                self._st2110_only()
             self.result = "ok"
         except HTTPException as exc:
             self._say(f"Failed: {exc.detail}")
@@ -144,7 +227,7 @@ def restart_after_step(job, size):
         say(f"The clock stepped by {size:+.3f} s, so the running MXL flows are out of step. "
             "Restarting the media functions.")
     try:
-        job.start(settings if settings["NDI_SRC"] else None, first, kind="ptp", audio=True)
+        job.start(settings if media_configured(settings) else None, first, kind="ptp", audio=True)
     except HTTPException:
         pass
 
@@ -207,7 +290,7 @@ def startup_sequence(job, ptpw):
         say("PTP function started recently (VM boot or restart). Waiting for it before starting media.")
         wait_for_ptp(ptpw, say)
     try:
-        job.start(settings if settings["NDI_SRC"] else None, first, kind="ptp", audio=True)
+        job.start(settings if media_configured(settings) else None, first, kind="ptp", audio=True)
     except HTTPException:
         pass
 

@@ -8,6 +8,7 @@ import socket
 import sys
 
 sys.path.insert(0, os.environ.get("LAB_SCRIPTS", "/opt/scripts"))
+import media_common as mc  # noqa: E402,F401  (re-exported for the other modules)
 import ptp_common as pc  # noqa: E402,F401  (re-exported for the other modules)
 
 CONFIG_DIR   = os.environ.get("CONFIG_DIR", "/config")
@@ -22,6 +23,7 @@ FLOW_AUDIO   = os.environ.get("FLOW_AUDIO", "7fbec3b1-1b0f-417d-9059-8b94a47197e
 AUDIO_STATUS = os.path.join(os.environ.get("PREVIEW_DIR", "/preview"), "audio-status.json")
 AUDIO_LEVELS = os.path.join(os.environ.get("PREVIEW_DIR", "/preview"), "audio-levels.json")
 SDP_FILE     = os.path.join(CONFIG_DIR, "aes67.sdp")
+ST2110_SDP   = os.path.join(CONFIG_DIR, "st2110-{}.sdp")
 # The page lives beside app.py, one level up from this package
 STATIC_DIR   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
 NDI_DIR      = os.path.join(CONFIG_DIR, "ndi")
@@ -37,6 +39,8 @@ SERVICES = {
     "ndi-out-original": "mxl-ndi-out-original",
     "ndi-out-vertical": "mxl-ndi-out-vertical",
     "aes67-out":        "mxl-aes67-out",
+    "st2110-out":       "mxl-st2110-out",
+    "fabric":           "mxl-fabric",
     "ptp":              "mxl-ptp",
 }
 
@@ -117,3 +121,15 @@ def pipeline_settings():
         "SCALER":  cfg.get("SCALER", env.get("SCALER", "lanczos")),
     }
 
+
+def media_configured(settings):
+    """
+    Whether there is anything for an ordered restart to start: an NDI source,
+    an ST 2110 SDP, or flows from the peer.
+    """
+    r = mc.routing_settings()
+    if r["input"] == "ndi":
+        return bool(settings["NDI_SRC"])
+    if r["input"] == "st2110":
+        return bool(mc.st2110_settings()["in_video_sdp"].strip())
+    return r["input"] == "peer" or r["flow_b"] == "peer"

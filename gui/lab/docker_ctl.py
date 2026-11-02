@@ -5,7 +5,7 @@ import docker
 import requests
 from fastapi import HTTPException
 
-from .settings import SERVICES, discovery_state, pc
+from .settings import SERVICES, discovery_state, mc, pc
 
 # What talking to the Docker socket can raise: the SDK's own errors, and the
 # connection errors underneath it when the socket is missing or refuses.
@@ -61,5 +61,13 @@ def container_status():
         out["ptp"] = {"status": "unused"}
     if not pc.audio_settings()["enabled"] and out.get("aes67-out", {}).get("status") != "missing":
         out["aes67-out"] = {"status": "unused"}
+    st = mc.st2110_settings()
+    if not any(o["enabled"] for o in st["out"].values()) and out.get("st2110-out", {}).get("status") != "missing":
+        out["st2110-out"] = {"status": "unused"}
+    if not mc.fabric_settings()["enabled"] and out.get("fabric", {}).get("status") != "missing":
+        out["fabric"] = {"status": "unused"}
+    # Ingest idles when Flow A comes from the peer or from nowhere
+    if mc.routing_settings()["input"] in ("peer", "none") and out.get("ndi-ingest", {}).get("status") != "missing":
+        out["ndi-ingest"] = {"status": "unused"}
     return out
 

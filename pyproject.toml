@@ -13,4 +13,4 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["lab", "ptp_common"]
+known-first-party = ["lab", "media_common", "ptp_common"]

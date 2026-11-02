@@ -45,6 +45,7 @@ services:
         UBUNTU: ${UBUNTU_VERSION:-24.04}
     container_name: mxl-ndi-ingest
     network_mode: host
+    # Runs the NDI or the ST 2110 ingest, whichever routing.json selects
     command: ["/opt/scripts/run-ingest.sh"]
 
   autoframe:
@@ -90,6 +91,51 @@ services:
     cap_add:
       - SYS_NICE
     command: ["python3", "/opt/scripts/aes67_out.py"]
+    restart: unless-stopped
+
+  # ST 2110-20 video out: Flow A and/or Flow B as RFC 4175 multicast, with
+  # SDPs. NET_ADMIN only for the optional fq pacing. Idles when turned off.
+  st2110-out:
+    image: mxl-lab:latest
+    container_name: mxl-st2110-out
+    env_file: .env
+    network_mode: host
+    depends_on:
+      - ndi-ingest
+    volumes:
+      - /dev/shm/mxl:/dev/shm/mxl
+      - ./config:/config
+      - ./scripts:/opt/scripts:ro
+      - preview:/preview
+      - ptp-run:/run/ptp
+    shm_size: "1gb"
+    init: true
+    cap_add:
+      - SYS_NICE
+      - NET_ADMIN
+    command: ["python3", "/opt/scripts/st2110_out.py"]
+    restart: unless-stopped
+
+  # MXL fabrics to and from the other lab: one mxl-fabrics-demo process per
+  # flow, as target (receive) or initiator (send). Privileged for the RDMA
+  # devices under /dev/infiniband, which only exist with an RDMA NIC, and for
+  # locking the registered memory. Idles when the fabric is turned off.
+  fabric:
+    image: mxl-lab:latest
+    container_name: mxl-fabric
+    env_file: .env
+    network_mode: host
+    privileged: true
+    ulimits:
+      memlock: -1
+    volumes:
+      - /dev/shm/mxl:/dev/shm/mxl
+      - ./config:/config
+      - ./scripts:/opt/scripts:ro
+      - preview:/preview
+    shm_size: "1gb"
+    init: true
+    command: ["python3", "/opt/scripts/run-fabric.py"]
     restart: unless-stopped
 
   # ptp4l (and phc2sys with hardware timestamping). Shares the VM's kernel, so

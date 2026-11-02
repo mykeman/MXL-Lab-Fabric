@@ -12,15 +12,17 @@
 <body>
 
 <header>
-  <h1>MXL lab control <small>v3</small></h1>
+  <h1>MXL lab control <small>v4 fabric</small></h1>
   <div class="chain" aria-label="Media functions">
-    <span class="lamp" id="lamp-ndi-ingest"><i></i>NDI in</span><span class="hop">›</span>
+    <span class="lamp" id="lamp-ndi-ingest"><i></i>Ingest</span><span class="hop">›</span>
     <span class="lamp" id="lamp-autoframe"><i></i>Autoframe</span><span class="hop">›</span>
     <span class="lamp" id="lamp-ndi-out-original"><i></i>Original out</span>
     <span class="lamp" id="lamp-ndi-out-vertical"><i></i>Vertical out</span>
   </div>
   <div class="chain" aria-label="Audio and timing">
     <span class="lamp" id="lamp-aes67-out"><i></i>AES67 out</span>
+    <span class="lamp" id="lamp-st2110-out"><i></i>2110 out</span>
+    <span class="lamp" id="lamp-fabric"><i></i>Fabric</span>
     <span class="lamp" id="lamp-ptp"><i></i>PTP</span>
   </div>
 </header>
@@ -30,6 +32,8 @@
   <button role="tab" id="t-ndi" aria-controls="tab-ndi" data-tab="ndi"><span class="dot" id="dot-ndi"></span>NDI</button>
   <button role="tab" id="t-framing" aria-controls="tab-framing" data-tab="framing"><span class="dot" id="dot-framing"></span><span class="long">9:16 framing</span><span class="short">Framing</span></button>
   <button role="tab" id="t-audio" aria-controls="tab-audio" data-tab="audio"><span class="dot" id="dot-audio"></span><span class="long">AES67 and clock</span><span class="short">Audio</span></button>
+  <button role="tab" id="t-st2110" aria-controls="tab-st2110" data-tab="st2110"><span class="dot" id="dot-st2110"></span>ST 2110</button>
+  <button role="tab" id="t-routing" aria-controls="tab-routing" data-tab="routing"><span class="dot" id="dot-routing"></span><span class="long">Routing and fabric</span><span class="short">Fabric</span></button>
 </nav>
 
 <main>
@@ -85,9 +89,9 @@
     <section aria-labelledby="flows-h">
       <h2 id="flows-h">MXL flows</h2>
       <div class="flows three">
-        <div class="flow"><div>Flow A, original</div><div class="rate" id="fa-rate">-</div><div class="sub" id="fa-sub"></div></div>
-        <div class="flow"><div>Flow B, vertical</div><div class="rate" id="fb-rate">-</div><div class="sub" id="fb-sub"></div></div>
-        <div class="flow"><div>Audio flow</div><div class="rate" id="fx-rate">-</div><div class="sub" id="fx-sub"></div></div>
+        <div class="flow"><div>Flow A, original <span class="via" id="fa-via"></span></div><div class="rate" id="fa-rate">-</div><div class="sub" id="fa-sub"></div></div>
+        <div class="flow"><div>Flow B, vertical <span class="via" id="fb-via"></span></div><div class="rate" id="fb-rate">-</div><div class="sub" id="fb-sub"></div></div>
+        <div class="flow"><div>Audio flow <span class="via" id="fx-via"></span></div><div class="rate" id="fx-rate">-</div><div class="sub" id="fx-sub"></div></div>
       </div>
       <p class="note">Video flows count grains per second, which should match the frame rate. The audio flow counts samples per second, which should be close to 48k.</p>
     </section>
@@ -339,6 +343,130 @@
         <span class="saved" id="p-current"></span>
       </div>
       <div class="joblog" id="ptp-log" hidden aria-live="polite"></div>
+    </section>
+      </div>
+    </div>
+  </div>
+  <div class="panel" id="tab-st2110" role="tabpanel" aria-labelledby="t-st2110" tabindex="0" hidden>
+    <div class="cols">
+      <div>
+    <section aria-labelledby="sin-h">
+      <h2 id="sin-h">ST 2110 input</h2>
+      <p class="note" style="margin-top:0">Used when the Routing tab sets the input to ST 2110. Paste each sender's SDP file. Video must be ST 2110-20, 4:2:2, 8 or 10 bit, progressive. Audio is optional, ST 2110-30 at 48 kHz.</p>
+      <label class="field"><span>Video SDP (ST 2110-20)</span><textarea id="s-vsdp" rows="9" spellcheck="false" placeholder="v=0&#10;o=- ...&#10;m=video 5004 RTP/AVP 96&#10;..."></textarea></label>
+      <p class="modehelp" id="s-vsum"></p>
+      <label class="field"><span>Audio SDP (ST 2110-30), optional</span><textarea id="s-asdp" rows="6" spellcheck="false"></textarea></label>
+      <p class="modehelp" id="s-asum"></p>
+      <div class="grid-wide">
+        <label class="field"><span>Receive interface</span><select id="s-in-iface"></select></label>
+        <label class="field"><span>Socket buffer, MB</span><input id="s-buf" type="number" min="8" max="2048"></label>
+      </div>
+      <p class="note">Receiving uncompressed video through kernel sockets is heavy: 1080p50 is about 2.6 Gb/s in 220,000 packets a second. Lost packets show as damaged lines. setup.sh raises the kernel's socket buffer limit to allow the buffer above.</p>
+      <div class="row">
+        <button class="btn go" id="s-in-apply">Apply input</button>
+        <span class="saved" id="s-in-current"></span>
+      </div>
+      <div class="joblog" id="st2110in-log" hidden aria-live="polite"></div>
+    </section>
+      </div>
+      <div>
+    <section aria-labelledby="sout-h">
+      <h2 id="sout-h">ST 2110-20 video out</h2>
+      <div class="readout num">
+        <span>State <b id="s-state">-</b></span>
+        <span>From <b id="s-src">-</b></span>
+        <span>Pacing <b id="s-paced">-</b></span>
+        <span>Reference <b id="s-ref">-</b></span>
+      </div>
+      <div id="s-outs"></div>
+      <h3>Network</h3>
+      <div class="grid-wide">
+        <label class="field"><span>Interface</span><select id="s-out-iface"></select></label>
+        <label class="field"><span>TTL</span><input id="s-ttl" type="number" min="1" max="255"></label>
+        <label class="field"><span>DSCP</span><input id="s-dscp" type="number" min="0" max="63"></label>
+        <label class="field"><span>Read delay, ms</span><input id="s-read" type="number" min="0" max="500" step="1"></label>
+        <label class="field"><span>RTP packet size</span><input id="s-mtu" type="number" min="576" max="8972"></label>
+      </div>
+      <label class="check"><input type="checkbox" id="s-pace"> Pace packets with the fq qdisc</label>
+      <p class="note">Video is sent as 4:2:2 10 bit with RTP timestamps on the PTP clock. Without pacing, each frame leaves as a burst, which software receivers accept and strict ST 2110-21 receivers may not. Pacing replaces the interface's root qdisc with fq, capped a little above each stream's rate.</p>
+      <p class="note">Read delay: how far behind its timestamp a frame is sent. It must cover the time a frame takes to reach MXL, including a hop over the fabric.</p>
+      <div class="row">
+        <button class="btn go" id="s-out-apply">Apply video out</button>
+      </div>
+      <div class="joblog" id="st2110-log" hidden aria-live="polite"></div>
+    </section>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="tab-routing" role="tabpanel" aria-labelledby="t-routing" tabindex="0" hidden>
+    <div class="cols">
+      <div>
+    <section aria-labelledby="route-h">
+      <h2 id="route-h">Routing</h2>
+      <p class="note" style="margin-top:0">Both labs run the same functions. Here you choose where each MXL flow comes from on this lab, and which flows go to the other lab over the fabric. A flow can be made here or received, not both.</p>
+      <h3>Flow A and audio come from</h3>
+      <div class="modes" role="group" aria-label="Input">
+        <button data-rin="ndi" aria-pressed="false">NDI</button>
+        <button data-rin="st2110" aria-pressed="false">ST 2110</button>
+        <button data-rin="peer" aria-pressed="false">The peer</button>
+        <button data-rin="none" aria-pressed="false">Nothing</button>
+      </div>
+      <p class="modehelp" id="rin-help"></p>
+      <h3>Flow B, the 9:16 picture, comes from</h3>
+      <div class="modes three" role="group" aria-label="Flow B source">
+        <button data-rb="local" aria-pressed="false">Autoframe here</button>
+        <button data-rb="peer" aria-pressed="false">The peer</button>
+        <button data-rb="off" aria-pressed="false">Not used</button>
+      </div>
+      <p class="modehelp" id="rb-help"></p>
+      <h3>NDI outputs</h3>
+      <label class="check"><input type="checkbox" id="r-ndi-a"> Flow A as NDI, "MXL Lab Original"</label>
+      <label class="check"><input type="checkbox" id="r-ndi-b"> Flow B as NDI, "MXL Lab Vertical"</label>
+      <h3>Send to the peer</h3>
+      <div id="r-send"></div>
+      <p class="note" id="r-warn" hidden></p>
+      <p class="note">Applying restarts the media functions in order. Flows from the peer are requested once this lab's targets are ready.</p>
+      <div class="row">
+        <button class="btn go" id="r-apply">Apply routing</button>
+        <span class="saved" id="r-current"></span>
+      </div>
+      <div class="joblog" id="routing-log" hidden aria-live="polite"></div>
+    </section>
+      </div>
+      <div>
+    <section aria-labelledby="fab-h">
+      <h2 id="fab-h">Fabric link</h2>
+      <div class="readout num">
+        <span>State <b id="f-state">-</b></span>
+        <span>This lab <b id="f-node">-</b></span>
+        <span>Peer <b id="f-peer">-</b></span>
+      </div>
+      <table class="sessions num" id="f-sessions"></table>
+      <label class="check"><input type="checkbox" id="f-enabled"> Use the fabric</label>
+      <div class="modes two" role="group" aria-label="Fabric provider">
+        <button data-fprov="verbs" aria-pressed="false">RoCEv2 (verbs)</button>
+        <button data-fprov="tcp" aria-pressed="false">TCP</button>
+      </div>
+      <p class="modehelp" id="fprov-help"></p>
+      <div class="grid-wide">
+        <label class="field"><span>Fabric interface</span><select id="f-iface"></select></label>
+        <label class="field"><span>Base port</span><input id="f-port" type="number" min="1024" max="65000"></label>
+        <label class="field"><span>Peer GUI address</span><input id="f-peer-url" autocomplete="off" spellcheck="false" placeholder="http://192.168.10.12:8080"></label>
+        <label class="field"><span>Peer login</span><input id="f-peer-user" autocomplete="off"></label>
+        <label class="field"><span>Peer password</span><input id="f-peer-pass" type="password" autocomplete="new-password" placeholder="unchanged"></label>
+      </div>
+      <p class="note">The peer GUI address is how the two labs pair: each tells the other what it sends and hands over its fabric address and memory keys. Media then moves NIC to NIC over the fabric interface. Both labs need PTP on the same grandmaster, since grains keep the sender's timestamps.</p>
+      <div class="row">
+        <button class="btn go" id="f-apply">Apply fabric</button>
+        <button class="btn" id="f-test">Test peer</button>
+        <button class="btn" id="f-repair">Pair again</button>
+      </div>
+      <div class="joblog" id="fabric-log" hidden aria-live="polite"></div>
+      <h3>Pairing log</h3>
+      <div class="joblog" id="f-log">-</div>
+      <h3>Fabric interfaces on this VM</h3>
+      <div class="joblog" id="f-ifaces">-</div>
     </section>
       </div>
     </div>

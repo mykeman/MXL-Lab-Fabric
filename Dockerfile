@@ -1,5 +1,6 @@
-# MXL lab image: MXL SDK and tools, MXL and NDI GStreamer plugins, OpenCV,
-# the YuNet face model and linuxptp. One image for every lab function.
+# MXL lab image: MXL SDK and tools (with MXL fabrics over libfabric), MXL and
+# NDI GStreamer plugins, OpenCV, the YuNet face model, linuxptp and the RDMA
+# userspace (rdma-core) for RoCEv2. One image for every lab function.
 #
 # UBUNTU is set by setup.sh to match the VM. Defaults to 24.04.
 ARG UBUNTU=24.04
@@ -15,6 +16,8 @@ ARG GST_PLUGINS_RS_REF=8d285659a2d3db5760f90cfa6993391f6380b348
 ARG OPENCV_VERSION=5.0.0.93
 ARG YUNET_REF=47534e27c9851bb1128ccc0102f1145e27f23f98
 ARG YUNET_SHA256=8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+# libfabric release MXL fabrics is developed against (its devcontainer uses it)
+ARG LIBFABRIC_REF=v2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -28,6 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-gi python3-numpy \
       gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
       libavahi-client3 libavahi-common3 \
+      autoconf automake libtool \
+      rdma-core libibverbs-dev librdmacm-dev ibverbs-providers ibverbs-utils \
+      rdmacm-utils perftest \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust
@@ -48,20 +54,31 @@ RUN ln -sf /usr/local/lib/libndi.so.6 /usr/local/lib/libndi.so && ldconfig
 ENV NDI_RUNTIME_DIR_V6=/usr/local/lib
 ENV NDI_RUNTIME_DIR_V5=/usr/local/lib
 
-# MXL SDK and tools
+# libfabric with the verbs provider (RoCEv2 through rdma-core) and tcp.
+# Ubuntu's own libfabric is too old for MXL fabrics.
+RUN git clone --depth 1 -b "${LIBFABRIC_REF}" https://github.com/ofiwg/libfabric.git /src/libfabric \
+ && cd /src/libfabric && ./autogen.sh \
+ && ./configure --prefix=/usr/local --enable-verbs=yes --enable-tcp=yes --enable-shm=yes \
+      --disable-kdreg2 --disable-memhooks-monitor --disable-uffd-monitor \
+ && make -j"$(nproc)" install && ldconfig
+
+# MXL SDK and tools, with MXL fabrics (mxl-fabrics-demo, mxl-fabrics-info)
 RUN git clone --filter=blob:none https://github.com/dmf-mxl/mxl.git /src/mxl \
  && git -C /src/mxl checkout --detach "${MXL_REF}"
 # The MXL CMake preset looks for vcpkg under $HOME, which is /root in the build
 RUN ln -sfn /opt/vcpkg /root/vcpkg
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 WORKDIR /src/mxl
-RUN cmake --preset Linux-GCC-Release \
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+RUN cmake --preset Linux-GCC-Release -DMXL_ENABLE_FABRICS_OFI=ON \
     || { tail -n 80 build/Linux-GCC-Release/vcpkg-manifest-install.log; exit 1; } \
  && cmake --build build/Linux-GCC-Release -j"$(nproc)" \
  && cp -a build/Linux-GCC-Release/lib/. /usr/local/lib/ \
+ && find build -name 'libmxl-fabrics*.so*' -exec cp -a {} /usr/local/lib/ \; \
  && find build -maxdepth 5 -type f -executable -name 'mxl-*' \
       -exec cp {} /usr/local/bin/ \; \
- && ldconfig
+ && ldconfig \
+ && mxl-fabrics-demo --help >/dev/null && mxl-fabrics-info --help >/dev/null
 
 # MXL GStreamer plugin
 WORKDIR /src/mxl/rust
@@ -98,11 +115,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # PTP (linuxptp: ptp4l, phc2sys, pmc) and interface tools for the GUI, plus a
-# check that the RTP and level elements used by aes67-out are present.
+# check that the RTP and level elements used by aes67-out and the ST 2110
+# functions are present.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       linuxptp ethtool iproute2 \
     && rm -rf /var/lib/apt/lists/* \
- && gst-inspect-1.0 rtpL24pay >/dev/null && gst-inspect-1.0 level >/dev/null
+ && for e in rtpL24pay rtpL24depay rtpvrawpay rtpvrawdepay rtpjitterbuffer level; do \
+      gst-inspect-1.0 "$e" >/dev/null || exit 1; done
 
 # Baked-in copies. docker-compose.yml also bind-mounts these so edits
 # on the host apply with a container restart.

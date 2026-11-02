@@ -61,7 +61,8 @@ ok "$PRETTY_NAME"
 [ "$(uname -m)" = "x86_64" ] || die "The NDI runtime used here is x86_64 only."
 
 for f in Dockerfile docker-compose.yml autoframe.py env.example gui/Dockerfile gui/app.py scripts/run-ingest.sh scripts/ndi-mode.sh scripts/lab-apply.sh \
-         scripts/ptp_common.py scripts/run-ptp.py scripts/aes67_out.py; do
+         scripts/ptp_common.py scripts/run-ptp.py scripts/aes67_out.py scripts/media_common.py scripts/run-fabric.py \
+         scripts/st2110_in.py scripts/st2110_out.py; do
   [ -f "$f" ] || die "Missing $f. Run setup.sh from inside the unzipped mxl-lab folder."
 done
 ok "lab files present"
@@ -87,7 +88,8 @@ sudo -v || die "sudo is required."
 step "Installing host packages"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  ca-certificates curl wget tar unzip python3 avahi-daemon avahi-utils >/dev/null
+  ca-certificates curl wget tar unzip python3 avahi-daemon avahi-utils \
+  rdma-core ibverbs-utils >/dev/null
 ok "packages installed"
 
 # ------------------------------------------------------------------- avahi
@@ -101,10 +103,13 @@ if command -v ufw >/dev/null && sudo ufw status | grep -q "Status: active"; then
   gui_port=$(grep -E '^GUI_PORT=' .env 2>/dev/null | cut -d= -f2 || true)
   gui_port=${gui_port:-8080}
   for rule in 5353/udp 5959:5969/tcp 5959:5969/udp 6960:6970/tcp 6960:6970/udp \
-              7960:7970/tcp 7960:7970/udp "${gui_port}/tcp" 319/udp 320/udp 9875/udp; do
+              7960:7970/tcp 7960:7970/udp "${gui_port}/tcp" 319/udp 320/udp 9875/udp \
+              4791/udp 47100:47102/tcp; do
     sudo ufw allow "$rule" >/dev/null
   done
-  ok "ufw rules added for NDI, PTP (319, 320), SAP (9875) and the GUI on ${gui_port}"
+  ok "ufw rules added for NDI, PTP (319, 320), SAP (9875), the GUI on ${gui_port},"
+  ok "RoCEv2 (4791) and the fabric's TCP ports (47100 to 47102)"
+  warn "ST 2110 inputs arrive on the UDP ports in their SDPs. Allow those too, for example: sudo ufw allow 5004/udp"
 else
   ok "ufw not active, nothing to open"
 fi
@@ -116,6 +121,34 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/mxl.conf
 if [ -d /dev/shm/mxl ]; then ok "created, and recreated at every boot"; else die "could not create /dev/shm/mxl"; fi
 shm_gb=$(df -BG --output=size /dev/shm | tail -1 | tr -dc '0-9')
 ok "/dev/shm is ${shm_gb} GB"
+
+# ------------------------------------------------- socket buffers, RDMA
+step "Network buffers for ST 2110"
+# A 1080p50 ST 2110-20 stream is about 220,000 packets a second. The ingest
+# asks for a 256 MB receive buffer; the kernel caps it at rmem_max.
+sudo tee /etc/sysctl.d/90-mxl-lab.conf >/dev/null <<'SYSCTL'
+net.core.rmem_max = 536870912
+net.core.wmem_max = 67108864
+net.core.netdev_max_backlog = 250000
+SYSCTL
+sudo sysctl -q --system >/dev/null
+ok "socket buffer limits raised (/etc/sysctl.d/90-mxl-lab.conf)"
+
+step "RDMA (for the fabric)"
+sudo modprobe -q mlx5_ib 2>/dev/null || true
+rdma_devs=$(ls /sys/class/infiniband 2>/dev/null | tr '\n' ' ')
+if [ -n "$rdma_devs" ]; then
+  ok "RDMA devices: ${rdma_devs}"
+  for dev in /sys/class/infiniband/*; do
+    for port in "$dev"/ports/*; do
+      [ -r "$port/link_layer" ] || continue
+      ok "$(basename "$dev") port $(basename "$port"): $(cat "$port/link_layer"), $(cat "$port/state" 2>/dev/null)"
+    done
+  done
+else
+  warn "No RDMA device found. The fabric can still run with the TCP provider."
+  warn "For RoCEv2, pass a ConnectX port through to this VM (see the README), then run setup.sh again."
+fi
 
 # --------------------------------------------------------------- time sync
 step "Time sync (for PTP)"
@@ -318,10 +351,10 @@ ok "mxl-lab-gui:latest built"
 step "Starting"
 $DOCKER compose create >/dev/null
 # The discovery server container always exists so the GUI can start and stop it.
-$DOCKER compose up -d --no-deps --force-recreate gui ndi-discovery ptp
+$DOCKER compose up -d --no-deps --force-recreate gui ndi-discovery ptp fabric
 [ "$ndi_mode" = local ] || $DOCKER stop mxl-ndi-discovery >/dev/null
-# aes67-out is started by the ordered start below, and only when turned on in the GUI
-$DOCKER compose create --force-recreate aes67-out >/dev/null
+# aes67-out and st2110-out are started by the ordered start below, and only when turned on in the GUI
+$DOCKER compose create --force-recreate aes67-out st2110-out >/dev/null
 if [ -n "$current_src" ]; then
   # Start the media functions in order with a clean MXL domain. Starting them
   # all at once can leave an output attached to a flow that is being replaced.
@@ -350,10 +383,10 @@ else
 fi
 
 if $DOCKER compose run --rm --no-deps --entrypoint sh autoframe -c \
-  'gst-inspect-1.0 mxlsink >/dev/null && gst-inspect-1.0 ndisrc >/dev/null && gst-inspect-1.0 rtpL24pay >/dev/null && command -v ptp4l >/dev/null'; then
-  ok "MXL, NDI and RTP GStreamer plugins and linuxptp are in the image"
+  'gst-inspect-1.0 mxlsink >/dev/null && gst-inspect-1.0 ndisrc >/dev/null && gst-inspect-1.0 rtpL24pay >/dev/null && gst-inspect-1.0 rtpvrawpay >/dev/null && command -v ptp4l >/dev/null && command -v mxl-fabrics-demo >/dev/null'; then
+  ok "MXL, NDI and RTP GStreamer plugins, MXL fabrics and linuxptp are in the image"
 else
-  warn "A GStreamer plugin or linuxptp is missing from the image"
+  warn "A GStreamer plugin, MXL fabrics or linuxptp is missing from the image"
 fi
 
 if [ -n "$current_src" ]; then
@@ -382,6 +415,8 @@ Setup complete.
                   on this VM, add ${ip} in NDI Access Manager on each PC.
   NDI outputs:    "MXL Lab Original" and "MXL Lab Vertical" under this VM's hostname
   AES67 audio:    off until you turn it on in the GUI under Audio out
+  ST 2110:        input and video out are on the GUI's ST 2110 tab
+  Fabric:         off until you turn it on in the GUI under Routing and fabric
   PTP:            off until you turn it on in the GUI under PTP timing
   Logs:           docker compose logs -f <service>
   Log out and back in to use docker without sudo.

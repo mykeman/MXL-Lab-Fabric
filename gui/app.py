@@ -10,6 +10,7 @@ The work is done in the lab package:
   lab.docker_ctl  container control and status
   lab.monitors    MXL flow, PTP and AES67 status watchers
   lab.jobs        ordered changes to the running lab
+  lab.fabric      pairing flows with the other lab over MXL fabrics
 """
 import asyncio
 import base64
@@ -28,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from lab.docker_ctl import DOCKER_ERRORS, container, container_status, dock
+from lab.fabric import FabricLink
 from lab.jobs import ApplyJob, restart_after_step, startup_sequence, wait_for_ptp
 from lab.monitors import FlowWatch, PtpWatch, audio_status
 from lab.ndi import NdiDiscovery, probe_source
@@ -42,12 +44,15 @@ from lab.settings import (
     SDP_FILE,
     SERVER_RE,
     SERVICES,
+    ST2110_SDP,
     STATIC_DIR,
     STATUS_IN,
     TUNING_CFG,
     TUNING_DEFAULTS,
     discovery_state,
     load_json,
+    mc,
+    media_configured,
     pc,
     pipeline_settings,
     vm_ip,
@@ -83,6 +88,8 @@ if GUI_USER and GUI_PASSWORD:
 ndi = NdiDiscovery()
 flows = FlowWatch()
 job = ApplyJob()
+fabric = FabricLink(job)
+job.fabric = fabric
 ptpw = PtpWatch()
 # A clock step outside an apply breaks the running MXL flows: restart them in order
 ptpw.on_step = lambda size: restart_after_step(job, size)
@@ -251,7 +258,7 @@ def set_discovery(body: DiscoveryIn):
         say("Scanning with the new setting, the source list refreshes within about 15 s")
 
     settings = pipeline_settings()
-    job.start(settings if settings["NDI_SRC"] else None, first, kind="discovery")
+    job.start(settings if media_configured(settings) else None, first, kind="discovery")
     return {"ok": True}
 
 
@@ -320,13 +327,13 @@ def apply_audio(body: AudioIn):
     settings = pipeline_settings()
     # The channel count is set where the audio enters MXL, so changing it
     # needs the whole chain restarted. Anything else only touches aes67-out.
-    full = data["channels"] != before["channels"] and bool(settings["NDI_SRC"])
+    full = data["channels"] != before["channels"] and media_configured(settings)
 
     def first(say):
         write_json_atomic(pc.AUDIO_CFG, data)
         say("Saved audio settings")
         if full:
-            say(f"Channel count changed to {data['channels']}, restarting from ndi-ingest")
+            say(f"Channel count changed to {data['channels']}, restarting from the ingest")
 
     job.start(settings if full else None, first, kind="audio", audio=True)
     return {"ok": True}
@@ -437,10 +444,309 @@ def apply_ptp(body: PtpIn):
         say("Restarting media functions, because the clock may have stepped")
 
     settings = pipeline_settings()
-    job.start(settings if settings["NDI_SRC"] else None, first, kind="ptp", audio=True)
+    job.start(settings if media_configured(settings) else None, first, kind="ptp", audio=True)
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- routing
+class RoutingIn(BaseModel):
+    input: str = "ndi"
+    flow_b: str = "local"
+    ndi_out_original: bool = True
+    ndi_out_vertical: bool = True
+    send: list[str] = []
+
+
+def routing_payload():
+    r = mc.routing_settings()
+    return {"settings": r, "local_flows": mc.local_flows(r), "peer_flows": mc.peer_flows(r),
+            "flow_ids": mc.FLOW_IDS, "choices": {"inputs": list(mc.INPUTS), "flow_b": list(mc.FLOW_B_SOURCES)}}
+
+
+@app.get("/api/routing")
+def get_routing():
+    return routing_payload()
+
+
+@app.post("/api/routing/apply")
+def apply_routing(body: RoutingIn):
+    if body.input not in mc.INPUTS:
+        raise HTTPException(400, "input must be ndi, st2110, peer or none")
+    if body.flow_b not in mc.FLOW_B_SOURCES:
+        raise HTTPException(400, "Flow B must be local, peer or off")
+    data = body.model_dump()
+    if data["input"] == "none" and data["flow_b"] == "local":
+        raise HTTPException(400, "autoframe needs Flow A. Choose an input, or take Flow B from the peer.")
+    local = mc.local_flows(data)
+    bad = [k for k in data["send"] if k not in local]
+    if bad:
+        raise HTTPException(400, "only flows made on this lab can be sent: "
+                                 + ", ".join(mc.FLOW_NAMES.get(k, k) for k in bad))
+    data["send"] = [k for k in mc.FLOW_IDS if k in data["send"]]
+    if (data["send"] or mc.peer_flows(data)) and not mc.fabric_settings()["enabled"]:
+        note = "The fabric is off, so nothing goes to or comes from the peer until it is turned on."
+    else:
+        note = None
+
+    def first(say):
+        write_json_atomic(mc.ROUTING_CFG, data)
+        say("Saved routing")
+        if note:
+            say(note)
+
+    settings = pipeline_settings()
+    job.start(settings, first, kind="routing")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- ST 2110
+class SdpCheckIn(BaseModel):
+    text: str = Field("", max_length=20000)
+    media: str = "video"
+
+
+class St2110InputIn(BaseModel):
+    in_video_sdp: str = Field("", max_length=20000)
+    in_audio_sdp: str = Field("", max_length=20000)
+    in_iface: str = ""
+    in_buffer_mb: int = Field(256, ge=8, le=2048)
+
+
+class St2110OutIn(BaseModel):
+    enabled: bool = False
+    address: str = "239.69.20.1"
+    port: int = Field(5004, ge=1024, le=65535)
+    payload_type: int = Field(96, ge=96, le=127)
+    session_name: str = Field("", max_length=64)
+
+
+class St2110OutputIn(BaseModel):
+    out: dict[str, St2110OutIn]
+    out_iface: str = ""
+    ttl: int = Field(16, ge=1, le=255)
+    dscp: int = Field(34, ge=0, le=63)
+    read_delay_ms: float = Field(40.0, ge=0, le=500)
+    mtu: int = Field(1460, ge=576, le=8972)
+    pace: bool = False
+
+
+def sdp_summary(text, media):
+    if not text.strip():
+        return None
+    try:
+        return {"ok": True, **mc.parse_sdp(text, media)}
+    except mc.SdpError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def st2110_status():
+    st = load_json(mc.ST2110_STATUS)
+    if st.get("ts"):
+        st["age"] = round(time.time() - st["ts"], 1)
+    return st
+
+
+@app.get("/api/st2110")
+def get_st2110():
+    cfg = mc.st2110_settings()
+    return {"settings": cfg, "video": sdp_summary(cfg["in_video_sdp"], "video"),
+            "audio": sdp_summary(cfg["in_audio_sdp"], "audio"), "status": st2110_status(),
+            **iface_choices()}
+
+
+@app.post("/api/st2110/check")
+def check_sdp(body: SdpCheckIn):
+    if body.media not in ("video", "audio"):
+        raise HTTPException(400, "media must be video or audio")
+    return sdp_summary(body.text, body.media) or {"ok": False, "error": "empty"}
+
+
+@app.post("/api/st2110/input")
+def apply_st2110_input(body: St2110InputIn):
+    try:
+        video = mc.parse_sdp(body.in_video_sdp, "video")
+    except mc.SdpError as exc:
+        raise HTTPException(400, f"video SDP: {exc}") from exc
+    if video["width"] < video["height"] or video["width"] > 4096 or video["height"] > 2160:
+        raise HTTPException(400, "only landscape video up to 4096x2160 is supported")
+    if body.in_audio_sdp.strip():
+        try:
+            mc.parse_sdp(body.in_audio_sdp, "audio")
+        except mc.SdpError as exc:
+            raise HTTPException(400, f"audio SDP: {exc}") from exc
+    check_iface(body.in_iface.strip())
+    cfg = mc.st2110_settings()
+    cfg.update(body.model_dump(), in_iface=body.in_iface.strip())
+    settings = pipeline_settings()
+    settings.update(SRC_W=video["width"], SRC_H=video["height"], SRC_FPS=video["fps"], SRC_AUTO=False)
+    active = mc.routing_settings()["input"] == "st2110"
+
+    def first(say):
+        write_json_atomic(mc.ST2110_CFG, cfg)
+        say(f"Saved ST 2110 input: {video['width']}x{video['height']} @ {video['fps']} "
+            f"from {video['address']}:{video['port']}")
+        if not active:
+            say("The input is not ST 2110 in the Routing tab, so nothing restarts")
+
+    job.start(settings if active else None, first, kind="st2110in")
+    return {"ok": True}
+
+
+@app.post("/api/st2110/output")
+def apply_st2110_output(body: St2110OutputIn):
+    cfg = mc.st2110_settings()
+    for key, o in body.out.items():
+        if key not in ("A", "B"):
+            raise HTTPException(400, "outputs are A and B")
+        address = o.address.strip()
+        if not MCAST_RE.fullmatch(address) or any(int(p) > 255 for p in address.split(".")):
+            raise HTTPException(400, f"{mc.FLOW_NAMES[key]}: address must be an IPv4 multicast address")
+        if o.port % 2:
+            raise HTTPException(400, f"{mc.FLOW_NAMES[key]}: RTP port must be even")
+        cfg["out"][key] = dict(o.model_dump(), address=address, session_name=o.session_name.strip())
+    dests = [(o["address"], o["port"]) for o in cfg["out"].values() if o["enabled"]]
+    if len(dests) != len(set(dests)):
+        raise HTTPException(400, "the two outputs need different destinations")
+    check_iface(body.out_iface.strip())
+    cfg.update(body.model_dump(exclude={"out"}), out_iface=body.out_iface.strip())
+
+    def first(say):
+        write_json_atomic(mc.ST2110_CFG, cfg)
+        say("Saved ST 2110 output settings")
+
+    job.start(None, first, kind="st2110", st2110=True)
+    return {"ok": True}
+
+
+@app.get("/api/st2110/sdp/{key}")
+def get_st2110_sdp(key: str):
+    if key not in ("A", "B"):
+        raise HTTPException(404, "no such output")
+    path = ST2110_SDP.format(key)
+    if not os.path.exists(path):
+        raise HTTPException(404, "no SDP yet. It is written once the output is sending.")
+    with open(path) as f:
+        text = f.read()
+    return Response(text, media_type="application/sdp",
+                    headers={"Content-Disposition": f'attachment; filename="mxl-lab-flow-{key}.sdp"',
+                             "Cache-Control": "no-store"})
+
+
+# ----------------------------------------------------------------- fabric
+PEER_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-\[\]:]+(:\d{1,5})?/?")
+
+
+class FabricIn(BaseModel):
+    enabled: bool = False
+    provider: str = "verbs"
+    iface: str = ""
+    base_port: int = Field(47100, ge=1024, le=65000)
+    peer_url: str = Field("", max_length=200)
+    peer_user: str = Field("", max_length=64)
+    # Blank keeps the saved password
+    peer_password: str = Field("", max_length=128)
+
+
+class AcceptIn(BaseModel):
+    key: str
+    flow_def: dict
+
+
+class ResendIn(BaseModel):
+    keys: list[str]
+
+
+def fabric_brief():
+    snap = fabric.snapshot()
+    runner = snap["runner"]
+    return {"enabled": mc.fabric_settings()["enabled"], "state": runner.get("state"),
+            "age": runner.get("age"), "provider": runner.get("provider"), "node": runner.get("node"),
+            "sessions": {k: {x: v.get(x) for x in ("role", "key", "state", "rate", "starts")}
+                         for k, v in (runner.get("sessions") or {}).items()},
+            "peer": {"ok": snap["peer"]["ok"], "error": snap["peer"]["error"], "info": snap["peer"]["info"]}}
+
+
+@app.get("/api/fabric")
+def get_fabric():
+    cfg = mc.fabric_settings()
+    cfg["peer_password"] = ""
+    cfg["has_password"] = bool(mc.fabric_settings()["peer_password"])
+    return {"settings": cfg, **fabric.snapshot(), "hello": fabric.hello(), **iface_choices()}
+
+
+@app.post("/api/fabric/apply")
+def apply_fabric(body: FabricIn):
+    if body.provider not in ("verbs", "tcp"):
+        raise HTTPException(400, "provider must be verbs or tcp")
+    url = body.peer_url.strip()
+    if url and not PEER_URL_RE.fullmatch(url):
+        raise HTTPException(400, "peer address must look like http://192.168.10.12:8080")
+    iface = body.iface.strip()
+    check_iface(iface)
+    if body.enabled and not pc.iface_ipv4(pc.resolve_iface(iface)):
+        raise HTTPException(400, "that interface has no IPv4 address. Give it one on the fabric network first.")
+    data = body.model_dump()
+    data.update(iface=iface, peer_url=url.rstrip("/"))
+    if not data["peer_password"]:
+        data["peer_password"] = mc.fabric_settings()["peer_password"]
+
+    def first(say):
+        fabric.clear(say)
+        write_json_atomic(mc.FABRIC_CFG, data)
+        say("Saved fabric settings")
+        c = container("fabric")
+        if c.status == "running":
+            c.restart(timeout=5)
+        else:
+            c.start()
+        say("Restarted the fabric function")
+        if not data["enabled"]:
+            say("The fabric is off")
+            return
+        if url:
+            peer = fabric.check_peer()
+            say(f"Peer {peer['info']['host']} answers" if peer["ok"] else f"Peer: {peer['error']}")
+        say("Flows pair within a few seconds")
+
+    job.start(None, first, kind="fabric")
+    return {"ok": True}
+
+
+@app.post("/api/fabric/test")
+def test_fabric():
+    return fabric.check_peer()
+
+
+@app.post("/api/fabric/repair")
+def repair_fabric():
+    """Pair everything again: our sends now, and ask the peer for what we receive."""
+    def work():
+        fabric.clear()
+        r = mc.routing_settings()
+        for key in r["send"]:
+            fabric.send(key)
+        if mc.peer_flows(r):
+            fabric.request(mc.peer_flows(r))
+    threading.Thread(target=work, daemon=True).start()
+    return {"ok": True}
+
+
+# Called by the other lab's GUI
+@app.get("/api/fabric/hello")
+def fabric_hello():
+    return fabric.hello()
+
+
+@app.post("/api/fabric/accept")
+def fabric_accept(body: AcceptIn):
+    if body.key not in mc.FLOW_IDS:
+        raise HTTPException(400, "unknown flow")
+    return {"target_info": fabric.accept(body.key, body.flow_def)}
+
+
+@app.post("/api/fabric/resend")
+def fabric_resend(body: ResendIn):
+    return {"ok": True, "sending": fabric.resend([k for k in body.keys if k in mc.FLOW_IDS])}
 
 
 @app.get("/api/tuning")
@@ -480,7 +786,8 @@ def status():
     return {"containers": containers, "docker_error": docker_error,
             "autoframe": af, "flows": flows.status(), "job": job.snapshot(),
             "ptp": ptpw.snapshot(), "ptp_mode": pc.ptp_settings()["mode"],
-            "audio": audio_status()}
+            "audio": audio_status(), "routing": mc.routing_settings(),
+            "st2110": st2110_status(), "fabric": fabric_brief()}
 
 
 _preview_cache = {"mtime": None, "meta": None, "jpg": None}

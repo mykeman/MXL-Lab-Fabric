@@ -3,6 +3,16 @@
 # Copyright 2026 Michael Rankin
 set -eu
 eval "$(python3 /opt/scripts/load-config.py)"
+
+case "${INPUT:-ndi}" in
+  st2110) exec python3 /opt/scripts/st2110_in.py ;;
+  ndi) ;;
+  *)
+    # Flow A comes from the other lab, or nothing: no ingest on this VM.
+    echo "ndi-ingest: input is '${INPUT}', nothing to ingest here. Idle."
+    exec sleep infinity ;;
+esac
+
 # SRC_FPS is either a whole number (50) or a fraction from auto-detect (60000/1001)
 case "$SRC_FPS" in
   */*) FPS_CAPS="$SRC_FPS" ;;

@@ -178,4 +178,16 @@ a.btn { color: inherit; text-decoration: none; display: inline-block; }
 .flows.three { grid-template-columns: 1fr 1fr 1fr; }
 @media (max-width: 560px) { .flows.three { grid-template-columns: 1fr; } }
 
+/* ST 2110 and fabric */
+.field textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; width: 100%; box-sizing: border-box; font: .85rem/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+.modehelp.bad { color: var(--fault); }
+.via { color: var(--muted); font-size: .85rem; }
+.sessions { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: .92rem; }
+.sessions th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
+.sessions td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); }
+.sessions .empty td { color: var(--muted); }
+.out2110 { background: var(--raised); border: 1px solid var(--line); border-radius: 3px; padding: 10px 14px 14px; margin-top: 12px; }
+.out2110 .check { margin-top: 0; }
+.out2110 .field input { background: var(--panel); }
+
 @media (prefers-reduced-motion: reduce) { .dot[data-h="busy"] { animation: none; } .window { transition: none; } .lamp i { box-shadow: none !important; } }
